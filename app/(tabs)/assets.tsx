@@ -17,6 +17,9 @@ type Asset = {
   current_price?: number;
   is_autoprestamo?: boolean;
   is_mercado_pago?: boolean;
+  base_quantity?: number;
+  base_invested?: number;
+  autoprestamos_deducted?: number;
 };
 
 const DEFAULT_GOAL = 248602903.00;
@@ -272,7 +275,10 @@ export default function AssetsScreen() {
             quantity: 1,
             average_buy_price: displayedInvested,
             current_price: displayedCurrent,
-            is_mercado_pago: true
+            is_mercado_pago: true,
+            base_quantity: baseCurrent,
+            base_invested: baseInvested,
+            autoprestamos_deducted: totalAutoprestamos
           };
         }
 
@@ -484,14 +490,20 @@ export default function AssetsScreen() {
       investedVal = asset.average_buy_price;
     }
 
-    const profitVal = currentVal - investedVal;
-    const profitPct = investedVal > 0 ? (profitVal / investedVal) * 100 : 0;
+    // Para Mercado Pago calculamos el rendimiento basándonos en los montos bases de la base de datos (sin el descuento del préstamo)
+    const profitVal = asset.is_mercado_pago && asset.base_quantity !== undefined && asset.base_invested !== undefined
+      ? (asset.base_quantity - asset.base_invested)
+      : (currentVal - investedVal);
+    const profitPct = asset.is_mercado_pago && asset.base_invested !== undefined
+      ? (asset.base_invested > 0 ? (profitVal / asset.base_invested) * 100 : 0)
+      : (investedVal > 0 ? (profitVal / investedVal) * 100 : 0);
     const unitPrice = asset.quantity > 0 ? (currentVal / asset.quantity) : 0;
 
     const mapped = {
       ...asset,
       currentValue: currentVal,
-      investedValue: investedVal,
+      // Para Mercado Pago mostramos el invertido original puro en el listado para transparencia
+      investedValue: asset.is_mercado_pago && asset.base_invested !== undefined ? asset.base_invested : investedVal,
       profit: profitVal,
       profitPercentage: profitPct,
       unitPrice: unitPrice
@@ -773,6 +785,20 @@ export default function AssetsScreen() {
                     <Text style={styles.assetItemUnitPrice}>Cant: {formatNumber(asset.quantity, 2)} | u: ${formatCurrency(asset.unitPrice)}</Text>
                   </View>
                 </View>
+
+                {/* Desglose de Mercado Pago (Opción B) */}
+                {asset.is_mercado_pago && asset.base_quantity !== undefined && asset.autoprestamos_deducted !== undefined && (
+                  <View style={styles.mpBreakdownContainer}>
+                    <View style={styles.mpBreakdownRow}>
+                      <Text style={styles.mpBreakdownLabel}>Saldo en Cuenta:</Text>
+                      <Text style={styles.mpBreakdownValue}>${formatCurrency(asset.base_quantity)}</Text>
+                    </View>
+                    <View style={styles.mpBreakdownRow}>
+                      <Text style={styles.mpBreakdownLabel}>Autopréstamos Tomados:</Text>
+                      <Text style={[styles.mpBreakdownValue, { color: '#FF4C4C' }]}>-${formatCurrency(asset.autoprestamos_deducted)}</Text>
+                    </View>
+                  </View>
+                )}
                 
                 {/* Diferencia / Rendimiento */}
                 <View style={styles.assetItemFooter}>
@@ -1064,4 +1090,8 @@ const styles = StyleSheet.create({
   saveBtnText: { color: '#000', fontSize: 14, fontWeight: 'bold' },
   modalProfitBadge: { padding: 12, borderRadius: 8, marginTop: 8, alignItems: 'center', justifyContent: 'center' },
   modalProfitText: { fontSize: 13, fontWeight: 'bold' },
+  mpBreakdownContainer: { marginTop: 10, padding: 10, backgroundColor: 'rgba(255, 255, 255, 0.02)', borderRadius: 8, gap: 4, borderWidth: 1, borderColor: '#222' },
+  mpBreakdownRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  mpBreakdownLabel: { color: '#666', fontSize: 12 },
+  mpBreakdownValue: { color: '#FFF', fontSize: 12, fontWeight: 'bold' },
 });
