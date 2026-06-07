@@ -83,7 +83,7 @@ export default function LiabilitiesScreen() {
         { text: 'Cancelar', style: 'cancel' },
         {
           text: 'Pagar',
-          onPress: async (val) => {
+          onPress: async (val?: string) => {
             const amount = Number(val);
             if (isNaN(amount) || amount <= 0) {
               Alert.alert('Monto inválido');
