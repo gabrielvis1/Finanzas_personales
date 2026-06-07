@@ -28,6 +28,7 @@ export default function AssetsScreen() {
   
   // Estados de carga y datos
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [rawAssets, setRawAssets] = useState<Asset[]>([]); // Activos puros de Supabase (sin deducción de UI)
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   
@@ -191,6 +192,7 @@ export default function AssetsScreen() {
         .eq('user_id', session!.user.id);
       
       if (assetsError) throw assetsError;
+      setRawAssets(assetsData || []);
 
       // 2. Cargar todas las cuotas de deudas pendientes
       const { data: debtsData, error: debtsError } = await supabase
@@ -327,20 +329,30 @@ export default function AssetsScreen() {
   };
 
   const handleOpenEditModal = (asset: Asset) => {
-    setEditingAsset(asset);
-    setFormName(asset.name);
-    setFormSymbol(asset.symbol);
-    setFormType(asset.type);
+    if (asset.is_autoprestamo) {
+      Alert.alert('Información', 'Los autopréstamos se calculan automáticamente a partir de tus deudas pendientes y no se pueden editar manualmente.');
+      return;
+    }
+
+    // Buscar el activo original en la lista pura para no usar valores modificados por UI (como quantity=1)
+    const rawAsset = rawAssets.find(r => r.id === asset.id) || asset;
+
+    setEditingAsset(rawAsset);
+    setFormName(rawAsset.name);
+    setFormSymbol(rawAsset.symbol);
+    setFormType(rawAsset.type);
     
-    if (asset.type === 'fiat' || asset.type === 'other') {
-      // Reconstruir capital invertido
-      const currentVal = asset.quantity;
-      const investedVal = asset.quantity * asset.average_buy_price;
+    if (rawAsset.type === 'fiat' || rawAsset.type === 'other') {
+      // Reconstruir capital invertido real usando los valores puros de la base de datos
+      const currentVal = rawAsset.quantity;
+      const investedVal = rawAsset.quantity * rawAsset.average_buy_price;
       setFormQuantity(String(currentVal));
       setFormInvestedCapital(String(investedVal));
+      setFormPrice('');
     } else {
-      setFormQuantity(String(asset.quantity));
-      setFormPrice(String(asset.average_buy_price));
+      setFormQuantity(String(rawAsset.quantity));
+      setFormPrice(String(rawAsset.average_buy_price));
+      setFormInvestedCapital('');
     }
     
     setIsModalVisible(true);
@@ -520,7 +532,7 @@ export default function AssetsScreen() {
   const goalProgress = investmentGoal > 0 ? Math.min(100, (patrimonioNetoPesos / investmentGoal) * 100) : 0;
 
   // RENDERIZADOR DE CHART DATA
-  // 1. Capital Neto
+  // 1. Capital Neto (filtrando cantidades cero o negativas para evitar crashes en PieChart)
   const netCapitalData = [
     {
       name: 'Propiedades',
@@ -543,26 +555,30 @@ export default function AssetsScreen() {
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
     }
-  ];
+  ].filter(item => item.amount > 0);
 
   // 2. Activos en Pesos Chart Data
   const chartColors = ['#FF4C4C', '#00D09E', '#FFD700', '#4BC0C0', '#9966FF', '#FF9F40', '#E53935', '#8E24AA', '#3949AB'];
-  const pesosChartData = pesosAssetsList.map((asset, index) => ({
-    name: asset.symbol,
-    amount: asset.currentValue,
-    color: chartColors[index % chartColors.length],
-    legendFontColor: '#A0A0A0',
-    legendFontSize: 11
-  })).sort((a, b) => b.amount - a.amount).slice(0, 8); // top 8 para que quepa en pantalla
+  const pesosChartData = pesosAssetsList
+    .filter(asset => asset.currentValue > 0)
+    .map((asset, index) => ({
+      name: asset.symbol,
+      amount: asset.currentValue,
+      color: chartColors[index % chartColors.length],
+      legendFontColor: '#A0A0A0',
+      legendFontSize: 11
+    })).sort((a, b) => b.amount - a.amount).slice(0, 8);
 
   // 3. Activos en Dólares Chart Data
-  const dollarsChartData = dollarsAssetsList.map((asset, index) => ({
-    name: asset.symbol,
-    amount: asset.currentValue,
-    color: chartColors[index % chartColors.length],
-    legendFontColor: '#A0A0A0',
-    legendFontSize: 11
-  })).sort((a, b) => b.amount - a.amount).slice(0, 8);
+  const dollarsChartData = dollarsAssetsList
+    .filter(asset => asset.currentValue > 0)
+    .map((asset, index) => ({
+      name: asset.symbol,
+      amount: asset.currentValue,
+      color: chartColors[index % chartColors.length],
+      legendFontColor: '#A0A0A0',
+      legendFontSize: 11
+    })).sort((a, b) => b.amount - a.amount).slice(0, 8);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -671,20 +687,27 @@ export default function AssetsScreen() {
         <Text style={styles.sectionTitle}>Distribución y Rendimiento de Inversiones</Text>
         
         {/* Gráfico 1: Capital Neto */}
-        <View style={styles.chartBlock}>
-          <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
-          <PieChart
-            data={netCapitalData}
-            width={chartWidth - 16}
-            height={160}
-            chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
-            accessor={"amount"}
-            backgroundColor={"transparent"}
-            paddingLeft={"0"}
-            center={[chartWidth / 6, 0]}
-            hasLegend={true}
-          />
-        </View>
+        {netCapitalData.length > 0 ? (
+          <View style={styles.chartBlock}>
+            <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
+            <PieChart
+              data={netCapitalData}
+              width={chartWidth - 16}
+              height={160}
+              chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
+              accessor={"amount"}
+              backgroundColor={"transparent"}
+              paddingLeft={"0"}
+              center={[chartWidth / 6, 0]}
+              hasLegend={true}
+            />
+          </View>
+        ) : (
+          <View style={styles.chartBlock}>
+            <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
+            <Text style={{ color: '#666', fontSize: 12, marginVertical: 40, textAlign: 'center' }}>No hay datos suficientes para mostrar la distribución</Text>
+          </View>
+        )}
 
         {/* Gráfico 2: Activos en Pesos */}
         {pesosChartData.length > 0 && (
@@ -916,6 +939,22 @@ export default function AssetsScreen() {
                 </>
               )}
 
+              {/* Vista previa de rendimiento / actualización para Fondos/Cash */}
+              {(formType === 'fiat' || formType === 'other') && (() => {
+                const invested = Number(formInvestedCapital);
+                const current = Number(formQuantity);
+                if (isNaN(invested) || isNaN(current) || invested <= 0) return null;
+                const diff = current - invested;
+                const pct = (diff / invested) * 100;
+                return (
+                  <View style={[styles.modalProfitBadge, { backgroundColor: diff >= 0 ? 'rgba(0, 208, 158, 0.15)' : 'rgba(255, 76, 76, 0.15)' }]}>
+                    <Text style={[styles.modalProfitText, { color: diff >= 0 ? '#00D09E' : '#FF4C4C' }]}>
+                      Actualización: {diff >= 0 ? 'Subió ▲' : 'Bajó ▼'} {diff >= 0 ? '+' : ''}${formatCurrency(diff)} ({formatNumber(pct, 2)}%)
+                    </Text>
+                  </View>
+                );
+              })()}
+
               <TouchableOpacity style={styles.saveBtn} onPress={handleSaveAsset}>
                 <Text style={styles.saveBtnText}>{editingAsset ? 'Actualizar Activo' : 'Guardar Activo'}</Text>
               </TouchableOpacity>
@@ -1023,4 +1062,6 @@ const styles = StyleSheet.create({
   typeSelectTextActive: { color: '#000', fontWeight: 'bold' },
   saveBtn: { backgroundColor: '#00D09E', padding: 12, borderRadius: 8, alignItems: 'center', marginTop: 12 },
   saveBtnText: { color: '#000', fontSize: 14, fontWeight: 'bold' },
+  modalProfitBadge: { padding: 12, borderRadius: 8, marginTop: 8, alignItems: 'center', justifyContent: 'center' },
+  modalProfitText: { fontSize: 13, fontWeight: 'bold' },
 });
