@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useFocusEffect } from 'expo-router';
 import { StyleSheet, View, Text, TouchableOpacity, TextInput, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Modal, ScrollView } from 'react-native';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/providers/AuthProvider';
@@ -21,6 +22,8 @@ type Budget = {
   order_index: number;
   is_debt?: boolean;
   debt_status?: string;
+  credit_limit?: number;
+  credit_used?: number;
 };
 
 const MONTHS = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
@@ -79,11 +82,13 @@ export default function BudgetsScreen() {
   
   const [isDragging, setIsDragging] = useState(false);
 
-  useEffect(() => {
-    if (session?.user?.id) {
-      loadMonthData();
-    }
-  }, [session, currentMonth, currentYear]);
+  useFocusEffect(
+    useCallback(() => {
+      if (session?.user?.id) {
+        loadMonthData();
+      }
+    }, [session, currentMonth, currentYear])
+  );
 
   const loadMonthData = async () => {
     setLoading(true);
@@ -119,6 +124,14 @@ export default function BudgetsScreen() {
         } else if (tx.type === 'expense') {
           const cat = tx.category.toLowerCase().trim();
           spentByCategory[cat] = (spentByCategory[cat] || 0) + Number(tx.amount);
+
+          // Si es un pago de deuda/crédito, acumular bajo nombres comunes de presupuesto de deudas/créditos
+          if (cat.startsWith('pago: ') || cat === 'pago de deuda' || cat === 'deudas / créditos' || cat === 'deudas / creditos' || cat === 'créditos' || cat === 'creditos') {
+            const commonDebtCats = ['pago de deuda', 'pago de deudas', 'deudas', 'deuda', 'créditos', 'creditos', 'pago de deuda', 'pago de deudas', 'deudas / créditos', 'deudas / creditos', 'créditos', 'creditos'];
+            commonDebtCats.forEach(c => {
+              spentByCategory[c] = (spentByCategory[c] || 0) + Number(tx.amount);
+            });
+          }
         }
       });
 
@@ -151,17 +164,35 @@ export default function BudgetsScreen() {
 
       const { data: debtData, error: debtError } = await supabase
         .from('debt_installments')
-        .select('*, credit_lines(name)')
+        .select('*, credit_lines(name, limit_amount)')
         .eq('user_id', session!.user.id)
         .eq('month', currentMonth + 1)
         .eq('year', currentYear);
 
       if (debtError) throw debtError;
 
-      const debtMapped = debtData?.map((d: any) => ({
+      const { data: allPendingDebt } = await supabase
+        .from('debt_installments')
+        .select('credit_line_id, amount')
+        .eq('user_id', session!.user.id)
+        .eq('status', 'pending');
+
+      const usedByCreditLine: Record<string, number> = {};
+      allPendingDebt?.forEach(d => {
+        if (d.credit_line_id) {
+          usedByCreditLine[d.credit_line_id] = (usedByCreditLine[d.credit_line_id] || 0) + Number(d.amount);
+        }
+      });
+
+      const debtMapped = debtData?.map((d: any) => {
+        const clId = d.credit_line_id;
+        const limit = d.credit_lines ? Number(d.credit_lines.limit_amount || 0) : 0;
+        const used = clId ? (usedByCreditLine[clId] || 0) : 0;
+
+        return {
           id: `debt_${d.id}`,
           category: `${d.credit_lines?.name || 'Crédito'}: ${d.description} (${d.installment_number}/${d.total_installments})`,
-          section: 'DEUDAS / CRÉDITOS',
+          section: 'CRÉDITOS',
           limit_amount: Number(d.amount),
           percentage: null,
           due_day: null,
@@ -172,8 +203,11 @@ export default function BudgetsScreen() {
           order_index: 999, 
           spent_amount: d.status === 'paid' ? Number(d.amount) : 0,
           is_debt: true,
-          debt_status: d.status
-      })) || [];
+          debt_status: d.status,
+          credit_limit: limit,
+          credit_used: used
+        };
+      }) || [];
 
       setBudgets([...mapped, ...debtMapped]);
     } catch (error: any) {
@@ -335,7 +369,7 @@ export default function BudgetsScreen() {
             name: b.category,
             amount: b.limit_amount,
             type: 'expense',
-            category: 'DEUDAS / CRÉDITOS',
+            category: 'CRÉDITOS',
             payment_method: 'debit',
             date: new Date().toISOString()
           });
@@ -373,6 +407,11 @@ export default function BudgetsScreen() {
   const totalBudget = budgets.reduce((acc, b) => acc + b.limit_amount, 0);
   const totalSpent = budgets.reduce((acc, b) => acc + b.spent_amount, 0);
   const remainingIncome = totalIncome - totalSpent; 
+  const toPayAmount = Math.max(0, totalBudget - totalSpent);
+  
+  // Dinero real que falta para cubrir lo que falta pagar: (Falta pagar - Lo que nos queda de ingresos)
+  const realMissingCash = Math.max(0, toPayAmount - remainingIncome);
+  const budgetPaidProgress = totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
 
   if (loading) {
     return <View style={styles.centered}><ActivityIndicator color="#00D09E" size="large" /></View>;
@@ -405,6 +444,26 @@ export default function BudgetsScreen() {
           </View>
         </View>
 
+        <View style={styles.paymentProgressBox}>
+          <View style={styles.paymentProgressHeader}>
+            <Text style={styles.paymentProgressLabel}>FALTA PAGAR DE MI PRESUPUESTO</Text>
+            <Text style={styles.paymentProgressValue}>${formatCurrency(toPayAmount)}</Text>
+          </View>
+          <View style={[styles.paymentProgressHeader, { borderTopWidth: 1, borderTopColor: '#2A2A2A', paddingTop: 8, marginTop: 8 }]}>
+            <Text style={styles.paymentProgressLabel}>DINERO REAL QUE ME FALTA APORTAR</Text>
+            <Text style={[styles.paymentProgressValue, { color: realMissingCash > 0 ? '#FF4C4C' : '#00D09E' }]}>
+              ${formatCurrency(realMissingCash)}
+            </Text>
+          </View>
+          <View style={[styles.paymentProgressBarContainer, { marginTop: 10 }]}>
+            <View style={[styles.paymentProgressBarFill, { width: `${budgetPaidProgress}%` }]} />
+          </View>
+          <View style={styles.paymentProgressFooter}>
+            <Text style={styles.paymentProgressSubtext}>Disponible / Restante: ${formatCurrency(remainingIncome)}</Text>
+            <Text style={styles.paymentProgressSubtext}>{formatNumber(budgetPaidProgress, 0)}% pagado</Text>
+          </View>
+        </View>
+
         {budgets.length === 0 && (
           <TouchableOpacity style={styles.cloneBtn} onPress={handleClonePreviousMonth}>
             <FontAwesome name="copy" size={16} color="#000" style={{marginRight: 8}} />
@@ -417,7 +476,7 @@ export default function BudgetsScreen() {
           const secSpent = sectionBudgets.reduce((acc, b) => acc + b.spent_amount, 0);
           const secLimit = sectionBudgets.reduce((acc, b) => acc + b.limit_amount, 0);
 
-          const bIsDebtSection = section === 'DEUDAS / CRÉDITOS';
+          const bIsDebtSection = section === 'CRÉDITOS';
           return (
             <View key={section} style={styles.sectionContainer}>
               <View style={[styles.sectionHeader, bIsDebtSection && { borderBottomColor: '#FFD700' }]}>
@@ -443,49 +502,87 @@ export default function BudgetsScreen() {
                   const isPartial = b.spent_amount > 0 && b.spent_amount < b.limit_amount;
                   const indicatorColor = isPaid ? '#00D09E' : (isPartial ? '#FFD700' : '#FF4C4C');
                   const pct = b.limit_amount > 0 ? formatNumber((b.spent_amount / b.limit_amount) * 100, 0) : '0';
+                  const numericPct = b.limit_amount > 0 ? Math.min(100, Math.round((b.spent_amount / b.limit_amount) * 100)) : 0;
+
+                  // Determine background color: manually chosen or automatic
+                  let rowBgColor = b.row_color;
+                  if (!rowBgColor) {
+                    if (isPaid) {
+                      rowBgColor = 'rgba(6, 78, 59, 0.45)'; // green
+                    } else if (isPartial) {
+                      rowBgColor = 'rgba(180, 83, 9, 0.45)'; // yellow
+                    } else {
+                      rowBgColor = 'rgba(127, 29, 29, 0.45)'; // red
+                    }
+                  }
+
+                  const limitVal = b.credit_limit || 0;
+                  const usedVal = b.credit_used || 0;
+                  const creditPct = limitVal > 0 ? Math.min(100, Math.round((usedVal / limitVal) * 100)) : 0;
 
                   return (
                     <View
-                      style={[styles.row, { backgroundColor: b.row_color || '#1A1A1A', opacity: isActive ? 0.7 : 1, transform: [{scale: isActive ? 1.02 : 1}], zIndex: isActive ? 99 : 1, elevation: isActive ? 5 : 0 }]}
+                      style={[styles.row, { backgroundColor: rowBgColor, opacity: isActive ? 0.7 : 1, transform: [{scale: isActive ? 1.02 : 1}], zIndex: isActive ? 99 : 1, elevation: isActive ? 5 : 0 }]}
                     >
                       <View style={[styles.colorIndicator, { backgroundColor: indicatorColor }]} />
-                      <View style={styles.rowContent}>
-                        <View style={{flex: 2, flexDirection: 'row', alignItems: 'center'}}>
-                          <FontAwesome name={(b.icon as any) || 'circle-o'} size={14} color="#00D09E" style={{marginRight: 8}} />
-                          <Text style={[styles.td, {fontWeight: 'bold', flex: 1}]} numberOfLines={1}>{b.category}</Text>
-                        </View>
-                        
-                        <Text style={[styles.td, {flex: 1.5, textAlign: 'right'}]}>${formatCurrency(b.spent_amount)}</Text>
-                        <Text style={[styles.td, {flex: 1.5, textAlign: 'right', fontSize: 11}]}>
-                            ${formatCurrency(b.limit_amount)}
-                        </Text>
-                        <Text style={[styles.td, {width: 40, textAlign: 'right', fontSize: 10}]}>{pct}%</Text>
-                        
-                        <View style={{width: 60, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center'}}>
-                          {b.is_debt ? (
-                            b.debt_status === 'paid' ? (
-                              <FontAwesome name="check-circle" size={20} color="#00D09E" style={{marginRight: 8}} />
+                      <View style={[styles.rowContent, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                        <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                          <View style={{flex: 2, flexDirection: 'row', alignItems: 'center'}}>
+                            <FontAwesome name={(b.icon as any) || 'circle-o'} size={14} color="#00D09E" style={{marginRight: 8}} />
+                            <Text style={[styles.td, {fontWeight: 'bold', flex: 1}]} numberOfLines={1}>{b.category}</Text>
+                          </View>
+                          
+                          <Text style={[styles.td, {flex: 1.5, textAlign: 'right'}]}>${formatCurrency(b.spent_amount)}</Text>
+                          <Text style={[styles.td, {flex: 1.5, textAlign: 'right', fontSize: 11}]}>
+                              ${formatCurrency(b.limit_amount)}
+                          </Text>
+                          <Text style={[styles.td, {width: 40, textAlign: 'right', fontSize: 10}]}>{pct}%</Text>
+                          
+                          <View style={{width: 60, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center'}}>
+                            {b.is_debt ? (
+                              b.debt_status === 'paid' ? (
+                                <FontAwesome name="check-circle" size={20} color="#00D09E" style={{marginRight: 8}} />
+                              ) : (
+                                <TouchableOpacity onPress={() => markDebtPaid(b)} style={{padding: 6}}>
+                                  <FontAwesome name="money" size={16} color="#FFD700" />
+                                </TouchableOpacity>
+                              )
                             ) : (
-                              <TouchableOpacity onPress={() => markDebtPaid(b)} style={{padding: 6}}>
-                                <FontAwesome name="money" size={16} color="#FFD700" />
-                              </TouchableOpacity>
-                            )
-                          ) : (
-                            <>
-                              <TouchableOpacity 
-                                activeOpacity={0.5}
-                                onPressIn={() => { setIsDragging(true); onDragStart(); }}
-                                onPressOut={() => { setIsDragging(false); onDragEnd(); }}
-                                style={{padding: 10}}
-                              >
-                                <FontAwesome name="bars" size={16} color={isActive ? '#00D09E' : '#888'} />
-                              </TouchableOpacity>
-                              <TouchableOpacity onPress={() => openEditModal(b)} style={{padding: 6}}>
-                                <FontAwesome name="cog" size={14} color="#AAA" />
-                              </TouchableOpacity>
-                            </>
-                          )}
+                              <>
+                                <TouchableOpacity 
+                                  activeOpacity={0.5}
+                                  onPressIn={() => { setIsDragging(true); onDragStart(); }}
+                                  onPressOut={() => { setIsDragging(false); onDragEnd(); }}
+                                  style={{padding: 10}}
+                                >
+                                  <FontAwesome name="bars" size={16} color={isActive ? '#00D09E' : '#888'} />
+                                </TouchableOpacity>
+                                <TouchableOpacity onPress={() => openEditModal(b)} style={{padding: 6}}>
+                                  <FontAwesome name="cog" size={14} color="#AAA" />
+                                </TouchableOpacity>
+                              </>
+                            )}
+                          </View>
                         </View>
+
+                        {/* Progress Bar for regular Budgets */}
+                        {!b.is_debt && b.limit_amount > 0 && (
+                          <View style={{marginTop: 6, height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
+                            <View style={{height: '100%', width: `${numericPct}%`, backgroundColor: indicatorColor, borderRadius: 2}} />
+                          </View>
+                        )}
+
+                        {b.is_debt && limitVal > 0 && (
+                          <View style={{marginTop: 6, borderTopWidth: 1, borderTopColor: '#333', paddingTop: 6}}>
+                            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 2}}>
+                              <Text style={{color: '#888', fontSize: 10}}>Límite de Crédito: ${formatCurrency(limitVal)}</Text>
+                              <Text style={{color: '#888', fontSize: 10}}>Uso: ${formatCurrency(usedVal)} ({creditPct}%)</Text>
+                            </View>
+                            <View style={{height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
+                              <View style={{height: '100%', width: `${creditPct}%`, backgroundColor: creditPct > 85 ? '#FF4C4C' : '#00D09E', borderRadius: 2}} />
+                            </View>
+                          </View>
+                        )}
                       </View>
                     </View>
                   );
@@ -652,5 +749,14 @@ const styles = StyleSheet.create({
   iconCircleActive: { borderColor: '#00D09E', backgroundColor: '#222' },
   colorRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20 },
   colorCircle: { width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
-  modalBtn: { padding: 14, borderRadius: 8, alignItems: 'center', justifyContent: 'center' }
+  modalBtn: { padding: 14, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+
+  paymentProgressBox: { backgroundColor: '#1A1A1A', padding: 16, marginHorizontal: 16, marginBottom: 16, borderRadius: 12 },
+  paymentProgressHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  paymentProgressLabel: { color: '#888', fontSize: 10, fontWeight: 'bold' },
+  paymentProgressValue: { color: '#FFD700', fontSize: 16, fontWeight: 'bold' },
+  paymentProgressBarContainer: { height: 6, backgroundColor: '#222', borderRadius: 3, overflow: 'hidden', marginBottom: 6 },
+  paymentProgressBarFill: { height: '100%', backgroundColor: '#00D09E', borderRadius: 3 },
+  paymentProgressFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  paymentProgressSubtext: { color: '#888', fontSize: 10 }
 });

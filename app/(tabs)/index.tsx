@@ -1,10 +1,12 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useFocusEffect } from 'expo-router';
 import { StyleSheet, View, Text, ScrollView, RefreshControl, Dimensions, TouchableOpacity, LogBox } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { FontAwesome } from '@expo/vector-icons';
 import { PieChart, LineChart } from 'react-native-chart-kit';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/providers/AuthProvider';
-import { formatCurrency } from '@/lib/utils';
+import { formatCurrency, formatNumber } from '@/lib/utils';
 
 // Ignorar advertencias específicas de React Native Web y SVG de librerías de terceros
 LogBox.ignoreLogs(['Unknown event handler property']);
@@ -54,6 +56,13 @@ export default function DashboardScreen() {
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth());
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
   
+  // Estados de activos y patrimonio en Dashboard
+  const [totalAssetsValue, setTotalAssetsValue] = useState(0);
+  const [netWealth, setNetWealth] = useState(0);
+  const [goalPct, setGoalPct] = useState(0);
+  const [hasGoal, setHasGoal] = useState(false);
+  const [goalVal, setGoalVal] = useState(0);
+
   // Estados de Gráficos y Desglose
   const [chartData, setChartData] = useState<any[]>([]);
   const [expenseBreakdown, setExpenseBreakdown] = useState<any[]>([]);
@@ -133,13 +142,17 @@ export default function DashboardScreen() {
 
       const chartColors = ['#FF4C4C', '#00D09E', '#FFD700', '#4BC0C0', '#9966FF', '#FF9F40', '#E53935', '#8E24AA', '#3949AB'];
       
-      const mappedChartData = Object.keys(catMap).map((cat, index) => ({
-        name: cat,
-        amount: catMap[cat],
-        color: chartColors[index % chartColors.length],
-        legendFontColor: '#A0A0A0',
-        legendFontSize: 11
-      })).sort((a, b) => b.amount - a.amount);
+      const mappedChartData = Object.keys(catMap).map((cat, index) => {
+        const catAmount = catMap[cat];
+        const pct = exp > 0 ? (catAmount / exp) * 100 : 0;
+        return {
+          name: `${cat} (${pct.toFixed(0)}%)`,
+          amount: catAmount,
+          color: chartColors[index % chartColors.length],
+          legendFontColor: '#A0A0A0',
+          legendFontSize: 11
+        };
+      }).sort((a, b) => b.amount - a.amount);
       
       setChartData(mappedChartData);
 
@@ -160,7 +173,9 @@ export default function DashboardScreen() {
       setExpenseBreakdown(breakdown);
     }
 
-    // 2. Obtener Deudas Pendientes (vigentes y atrasadas)
+
+    // 2. Obtener Deudas Pendientes (vigentes y atrasadas) y calcular total de deudas vigentes
+    let activeDebtsSum = 0;
     const { data: allDebtData, error: debtErr } = await supabase
       .from('debt_installments')
       .select('*, credit_lines(name, type)')
@@ -172,9 +187,8 @@ export default function DashboardScreen() {
         return d.year < currentYear || (d.year === currentYear && d.month <= currentMonth + 1);
       });
       
-      let totalDebt = 0;
-      currentAndOverdue.forEach(d => totalDebt += Number(d.amount));
-      setDebts(totalDebt);
+      currentAndOverdue.forEach(d => activeDebtsSum += Number(d.amount));
+      setDebts(activeDebtsSum);
 
       const sortedDebts = [...currentAndOverdue].sort((a, b) => {
         const aOverdue = a.year < currentYear || (a.year === currentYear && a.month < currentMonth + 1);
@@ -190,6 +204,80 @@ export default function DashboardScreen() {
       setDebts(0);
       setDetailedDebts([]);
     }
+
+    // 3. Obtener deudas totales de la base de datos (todas las cuotas pendientes) para patrimonio neto
+    let allPendingDebtsSum = 0;
+    let totalAutoprestamos = 0;
+    if (allDebtData && !debtErr) {
+      allDebtData.forEach(d => {
+        const amt = Number(d.amount);
+        allPendingDebtsSum += amt;
+        const clName = (d.credit_lines?.name || '').toLowerCase();
+        if (clName.includes('autoprestamo') || clName.includes('autopréstamo') || clName.includes('prestamos personales') || clName.includes('préstamos personales')) {
+          totalAutoprestamos += amt;
+        }
+      });
+    }
+
+    // 4. Obtener Activos y calcular valorización en ARS (utilizando ccl rate y live prices aproximados)
+    try {
+      const { data: assetsData } = await supabase
+        .from('assets')
+        .select('*')
+        .eq('user_id', session.user.id);
+
+      // Obtener cotizaciones de dolarapi ccl
+      let cclRate = 1350;
+      try {
+        const res = await fetch('https://dolarapi.com/v1/dolares/ccl');
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.venta) cclRate = Number(data.venta);
+        }
+      } catch (e) {}
+
+      let assetsSumARS = 0;
+      if (assetsData) {
+        assetsData.forEach(asset => {
+          const sym = asset.symbol.toUpperCase().trim();
+          const n = asset.name.toLowerCase().trim();
+          const isUSD = sym.startsWith('USD:') || sym.startsWith('EUR:') || sym.startsWith('BRL:') || sym === 'BTC' || sym === 'ETH' || sym === 'USDT' || sym.includes('USD') || n.includes('dolar') || n.includes('crypto');
+
+          let valueARS = 0;
+          if (sym === 'PRESTAMOS PERSONALES' || n.includes('autoprestamo') || n.includes('autopréstamo') || n.includes('prestamos personales')) {
+            valueARS = totalAutoprestamos;
+          } else if (sym === 'MERCADO PAGO' || n.includes('mercado pago')) {
+            valueARS = Math.max(0, asset.quantity - totalAutoprestamos);
+          } else {
+            const price = asset.current_price || asset.average_buy_price || 0;
+            if (isUSD) {
+              valueARS = asset.quantity * price * cclRate;
+            } else {
+              valueARS = asset.quantity * price;
+            }
+          }
+          assetsSumARS += valueARS;
+        });
+      }
+      setTotalAssetsValue(assetsSumARS);
+      const wealth = assetsSumARS - allPendingDebtsSum;
+      setNetWealth(wealth);
+
+      // Cargar meta de inversión del AsyncStorage
+      const savedGoal = await AsyncStorage.getItem('finiax_investment_goal');
+      const savedGoalCurrency = await AsyncStorage.getItem('finiax_goal_currency');
+      if (savedGoal) {
+        const goalNum = Number(savedGoal);
+        setGoalVal(goalNum);
+        setHasGoal(true);
+        let goalARS = goalNum;
+        if (savedGoalCurrency === 'USD') goalARS = goalNum * cclRate;
+        const progress = goalARS > 0 ? Math.min(100, (wealth / goalARS) * 100) : 0;
+        setGoalPct(progress);
+      } else {
+        setHasGoal(false);
+      }
+    } catch (e) {}
 
   }, [session, currentMonth, currentYear]);
 
@@ -318,13 +406,12 @@ export default function DashboardScreen() {
     }
   }, [session, currentMonth, currentYear, compareMonthB, compareYearB]);
 
-  useEffect(() => {
-    fetchTransactions();
-  }, [fetchTransactions]);
-
-  useEffect(() => {
-    fetchComparisonData();
-  }, [fetchComparisonData]);
+  useFocusEffect(
+    useCallback(() => {
+      fetchTransactions();
+      fetchComparisonData();
+    }, [fetchTransactions, fetchComparisonData])
+  );
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -484,6 +571,36 @@ export default function DashboardScreen() {
         <Text style={styles.balanceValue}>${formatCurrency(balance)}</Text>
       </View>
 
+      {/* Resumen de Activos y Patrimonio Neto */}
+      <View style={styles.assetsDashboardCard}>
+        <Text style={styles.assetsDashboardTitle}>PATRIMONIO Y PORTAFOLIO</Text>
+        <View style={styles.assetsDashboardGrid}>
+          <View style={styles.assetsDashboardCol}>
+            <Text style={styles.assetsDashboardLabel}>Patrimonio Neto</Text>
+            <Text style={[styles.assetsDashboardValue, { color: netWealth < 0 ? '#FF4C4C' : '#00D09E' }]}>
+              ${formatCurrency(netWealth)}
+            </Text>
+          </View>
+          <View style={styles.assetsDashboardCol}>
+            <Text style={styles.assetsDashboardLabel}>Valor de Activos</Text>
+            <Text style={styles.assetsDashboardValue}>${formatCurrency(totalAssetsValue)}</Text>
+          </View>
+        </View>
+        
+        {hasGoal && (
+          <View style={styles.assetsDashboardGoalSection}>
+            <View style={styles.assetsDashboardGoalHeader}>
+              <Text style={styles.assetsDashboardGoalText}>Progreso hacia Meta de Ahorro</Text>
+              <Text style={styles.assetsDashboardGoalPct}>{formatNumber(goalPct, 1)}%</Text>
+            </View>
+            <View style={styles.assetsDashboardGoalBarBg}>
+              <View style={[styles.assetsDashboardGoalBarFill, { width: `${goalPct}%` }]} />
+            </View>
+            <Text style={styles.assetsDashboardGoalSubtext}>Meta: ${formatCurrency(goalVal)}</Text>
+          </View>
+        )}
+      </View>
+
       <View style={styles.statsContainer}>
         <View style={[styles.statCard, { borderLeftColor: '#00D09E', borderLeftWidth: 4 }]}>
           <Text style={styles.statLabel}>Ingresos</Text>
@@ -496,7 +613,7 @@ export default function DashboardScreen() {
       </View>
 
       <View style={[styles.statCard, { marginTop: 16, borderLeftColor: '#FFD700', borderLeftWidth: 4 }]}>
-        <Text style={styles.statLabel}>Deudas Pendientes</Text>
+        <Text style={styles.statLabel}>Deudas del Periodo</Text>
         <Text style={[styles.statValue, { color: '#FFD700' }]}>${formatCurrency(debts)}</Text>
       </View>
 
@@ -556,6 +673,14 @@ export default function DashboardScreen() {
                   hasLegend={false}
                 />
               </View>
+            </View>
+          </View>
+          
+          {/* Resumen del total de porcentajes de gastos */}
+          <View style={styles.chartTotalSumRow}>
+            <Text style={styles.chartTotalSumLabel}>Suma de Gastos Registrados</Text>
+            <View style={styles.chartTotalSumBadge}>
+              <Text style={styles.chartTotalSumValue}>${formatCurrency(expenses)} (100%)</Text>
             </View>
           </View>
 
@@ -1013,4 +1138,23 @@ const styles = StyleSheet.create({
   // Comparador - Gráfico
   compChartWrapper: { marginTop: 10, alignItems: 'center' },
   compChartTitle: { color: '#DDD', fontSize: 12, fontWeight: 'bold', marginBottom: 8, alignSelf: 'flex-start' },
+
+  assetsDashboardCard: { backgroundColor: '#1A1A1A', padding: 20, borderRadius: 16, marginBottom: 24, borderWidth: 1, borderColor: '#333' },
+  assetsDashboardTitle: { color: '#A0A0A0', fontSize: 11, fontWeight: 'bold', marginBottom: 12, letterSpacing: 1 },
+  assetsDashboardGrid: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
+  assetsDashboardCol: { flex: 1 },
+  assetsDashboardLabel: { color: '#888', fontSize: 11, marginBottom: 4 },
+  assetsDashboardValue: { color: '#FFF', fontSize: 20, fontWeight: 'bold' },
+  assetsDashboardGoalSection: { borderTopWidth: 1, borderTopColor: '#2A2A2A', paddingTop: 12 },
+  assetsDashboardGoalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  assetsDashboardGoalText: { color: '#AAA', fontSize: 11 },
+  assetsDashboardGoalPct: { color: '#00D09E', fontSize: 12, fontWeight: 'bold' },
+  assetsDashboardGoalBarBg: { height: 6, backgroundColor: '#2E2E2E', borderRadius: 3, overflow: 'hidden', marginBottom: 4 },
+  assetsDashboardGoalBarFill: { height: '100%', backgroundColor: '#00D09E', borderRadius: 3 },
+  assetsDashboardGoalSubtext: { color: '#666', fontSize: 10, textAlign: 'right' },
+
+  chartTotalSumRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, paddingHorizontal: 4 },
+  chartTotalSumLabel: { color: '#888', fontSize: 12 },
+  chartTotalSumBadge: { backgroundColor: 'rgba(0, 208, 158, 0.15)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6 },
+  chartTotalSumValue: { color: '#00D09E', fontSize: 12, fontWeight: 'bold' }
 });

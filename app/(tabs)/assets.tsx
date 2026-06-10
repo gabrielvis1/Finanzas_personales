@@ -1,10 +1,10 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { StyleSheet, View, Text, ScrollView, TouchableOpacity, TextInput, ActivityIndicator, Alert, Modal, Dimensions, RefreshControl } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '@/lib/supabase';
-import { useAuth } from '@/providers/AuthProvider';
 import { formatCurrency, formatNumber } from '@/lib/utils';
+import { useAuth } from '@/providers/AuthProvider';
 import { FontAwesome } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Dimensions, Modal, RefreshControl, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { PieChart } from 'react-native-chart-kit';
 
 type Asset = {
@@ -22,43 +22,84 @@ type Asset = {
   autoprestamos_deducted?: number;
 };
 
+type DisplayCurrency = 'ARS' | 'USD' | 'EUR' | 'BRL' | 'BTC' | 'ETH';
+type NativeCurrency = 'ARS' | 'USD' | 'EUR' | 'BRL';
+
+const DISPLAY_CURRENCY_OPTIONS: { value: DisplayCurrency; label: string; symbol: string }[] = [
+  { value: 'ARS', label: 'ARS (Pesos)', symbol: '$' },
+  { value: 'USD', label: 'USD (Dólares)', symbol: 'u$s' },
+  { value: 'EUR', label: 'EUR (Euros)', symbol: '€' },
+  { value: 'BRL', label: 'BRL (Reales)', symbol: 'R$' },
+  { value: 'BTC', label: 'BTC (Bitcoin)', symbol: '₿' },
+  { value: 'ETH', label: 'ETH (Ethereum)', symbol: 'Ξ' },
+];
+
+const NATIVE_CURRENCY_OPTIONS: { value: NativeCurrency; label: string }[] = [
+  { value: 'ARS', label: 'ARS ($)' },
+  { value: 'USD', label: 'USD (u$s)' },
+  { value: 'EUR', label: 'EUR (€)' },
+  { value: 'BRL', label: 'BRL (R$)' },
+];
+
 const DEFAULT_GOAL = 248602903.00;
 const screenWidth = Dimensions.get('window').width;
 const chartWidth = screenWidth - 48;
 
 export default function AssetsScreen() {
   const { session } = useAuth();
-  
+
   // Estados de carga y datos
   const [assets, setAssets] = useState<Asset[]>([]);
   const [rawAssets, setRawAssets] = useState<Asset[]>([]); // Activos puros de Supabase (sin deducción de UI)
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  
+
+  // Estados de monedas y visualización
+  const [displayCurrency, setDisplayCurrency] = useState<DisplayCurrency>('ARS');
+  const [showCurrencySelector, setShowCurrencySelector] = useState(false);
+  const [formCurrency, setFormCurrency] = useState<NativeCurrency>('ARS');
+  const [showListView, setShowListView] = useState(true);
+
+  // Metas con tipo de divisa
+  const [goalCurrency, setGoalCurrency] = useState<NativeCurrency>('ARS');
+
+  // Estados temporales para formulario de edición de la meta
+  const [goalCurrencyInput, setGoalCurrencyInput] = useState<NativeCurrency>('ARS');
+
+  // Tasas de cambio adicionales
+  const [eurRate, setEurRate] = useState(1400); // Fallback EUR/ARS
+  const [brlRate, setBrlRate] = useState(240);  // Fallback BRL/ARS
+  const [btcUsdPrice, setBtcUsdPrice] = useState(65000); // Fallback BTC/USD
+  const [ethUsdPrice, setEthUsdPrice] = useState(3500);  // Fallback ETH/USD
+
   // Tipo de cambio Dólar CCL y Meta de Inversión
-  const [exchangeRate, setExchangeRate] = useState(1350); 
+  const [exchangeRate, setExchangeRate] = useState(1350);
   const [investmentGoal, setInvestmentGoal] = useState(DEFAULT_GOAL);
   const [totalDebts, setTotalDebts] = useState(0);
 
   // Estados de Formularios (Modal de Carga y Edición)
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [editingAsset, setEditingAsset] = useState<Asset | null>(null);
-  
+
   const [formName, setFormName] = useState('');
   const [formSymbol, setFormSymbol] = useState('');
   const [formType, setFormType] = useState('stock'); // 'stock', 'crypto', 'fiat', 'other'
   const [formQuantity, setFormQuantity] = useState('');
   const [formPrice, setFormPrice] = useState('');
   const [formInvestedCapital, setFormInvestedCapital] = useState(''); // Para fiat/cash manual
-  
+
   const [isEditingGoal, setIsEditingGoal] = useState(false);
   const [goalInput, setGoalInput] = useState('');
 
-  // Identificadores de tipos de activos
+  // Identificadores de tipos de activos y moneda nativa
   const isUSDAsset = useCallback((symbol: string, name: string) => {
+    if (!symbol) return false;
     const sym = symbol.toUpperCase().trim();
-    const n = name.toLowerCase().trim();
+    const n = (name || '').toLowerCase().trim();
     return (
+      sym.startsWith('USD:') ||
+      sym.startsWith('EUR:') ||
+      sym.startsWith('BRL:') ||
       sym === 'BTC' ||
       sym === 'ETH' ||
       sym === 'BNB' ||
@@ -70,6 +111,100 @@ export default function AssetsScreen() {
       n.includes('crypto')
     );
   }, []);
+
+  const getAssetNativeCurrency = useCallback((symbol: string): NativeCurrency => {
+    if (!symbol) return 'ARS';
+    const sym = symbol.toUpperCase().trim();
+    if (sym.startsWith('USD:')) return 'USD';
+    if (sym.startsWith('EUR:')) return 'EUR';
+    if (sym.startsWith('BRL:')) return 'BRL';
+    if (sym.startsWith('ARS:')) return 'ARS';
+    // Fallback heurístico
+    if (isUSDAsset(symbol, '')) return 'USD';
+    return 'ARS';
+  }, [isUSDAsset]);
+
+  const getCleanSymbol = useCallback((symbol: string): string => {
+    if (!symbol) return '';
+    const parts = symbol.split(':');
+    if (parts.length > 1 && ['USD', 'EUR', 'BRL', 'ARS'].includes(parts[0].toUpperCase())) {
+      return parts.slice(1).join(':');
+    }
+    return symbol;
+  }, []);
+
+  const convertFromARS = useCallback((valueARS: number, target: DisplayCurrency): number => {
+    if (target === 'ARS') return valueARS;
+    
+    // Todo lo convertimos a USD primero como pivot
+    const valueUSD = exchangeRate > 0 ? (valueARS / exchangeRate) : 0;
+    if (target === 'USD') return valueUSD;
+
+    if (target === 'EUR') {
+      const eurToArs = eurRate || (exchangeRate * 1.05); // Fallback EUR/ARS
+      return eurToArs > 0 ? (valueARS / eurToArs) : 0;
+    }
+    if (target === 'BRL') {
+      const brlToArs = brlRate || (exchangeRate * 0.18); // Fallback BRL/ARS
+      return brlToArs > 0 ? (valueARS / brlToArs) : 0;
+    }
+    if (target === 'BTC') {
+      return btcUsdPrice > 0 ? (valueUSD / btcUsdPrice) : 0;
+    }
+    if (target === 'ETH') {
+      return ethUsdPrice > 0 ? (valueUSD / ethUsdPrice) : 0;
+    }
+    return valueARS;
+  }, [exchangeRate, eurRate, brlRate, btcUsdPrice, ethUsdPrice]);
+
+  const convertAsset = useCallback((asset: Asset) => {
+    const nativeCur = getAssetNativeCurrency(asset.symbol);
+    
+    let currentValueARS = 0;
+    let investedValueARS = 0;
+
+    if (asset.type === 'fiat' || asset.type === 'other') {
+      const currentNative = asset.quantity;
+      const investedNative = asset.quantity * asset.average_buy_price;
+
+      // Convertir desde la moneda nativa a ARS
+      if (nativeCur === 'ARS') {
+        currentValueARS = currentNative;
+        investedValueARS = investedNative;
+      } else if (nativeCur === 'USD') {
+        currentValueARS = currentNative * exchangeRate;
+        investedValueARS = investedNative * exchangeRate;
+      } else if (nativeCur === 'EUR') {
+        currentValueARS = currentNative * eurRate;
+        investedValueARS = investedNative * eurRate;
+      } else if (nativeCur === 'BRL') {
+        currentValueARS = currentNative * brlRate;
+        investedValueARS = investedNative * brlRate;
+      }
+    } else {
+      // Acciones/Crypto (almacenados ya en moneda correspondiente: crypto en USD, stocks en ARS)
+      const isUSD = isUSDAsset(asset.symbol, asset.name);
+      const currentPrice = asset.current_price || asset.average_buy_price;
+      
+      if (isUSD) {
+        currentValueARS = asset.quantity * currentPrice * exchangeRate;
+        investedValueARS = asset.quantity * asset.average_buy_price * exchangeRate;
+      } else {
+        currentValueARS = asset.quantity * currentPrice;
+        investedValueARS = asset.quantity * asset.average_buy_price;
+      }
+    }
+
+    if (asset.is_mercado_pago) {
+      currentValueARS = (asset.current_price || 0);
+      investedValueARS = asset.average_buy_price;
+    }
+
+    return {
+      currentValueARS,
+      investedValueARS,
+    };
+  }, [getAssetNativeCurrency, isUSDAsset, exchangeRate, eurRate, brlRate]);
 
   const isCryptoSymbol = (symbol: string): boolean => {
     return ['BTC', 'ETH', 'BNB', 'USDT', 'SOL'].includes(symbol.toUpperCase().trim());
@@ -95,8 +230,16 @@ export default function AssetsScreen() {
       if (savedGoal) {
         setInvestmentGoal(Number(savedGoal));
       }
+      const savedCurrency = await AsyncStorage.getItem('finiax_display_currency');
+      if (savedCurrency) {
+        setDisplayCurrency(savedCurrency as DisplayCurrency);
+      }
+      const savedGoalCurrency = await AsyncStorage.getItem('finiax_goal_currency');
+      if (savedGoalCurrency) {
+        setGoalCurrency(savedGoalCurrency as NativeCurrency);
+      }
     } catch (e) {
-      console.warn('Error al cargar la meta desde almacenamiento local:', e);
+      console.warn('Error al cargar la configuración desde almacenamiento local:', e);
     }
   };
 
@@ -108,7 +251,11 @@ export default function AssetsScreen() {
     }
     try {
       setInvestmentGoal(numericGoal);
+      setGoalCurrency(goalCurrencyInput);
+      
       await AsyncStorage.setItem('finiax_investment_goal', String(numericGoal));
+      await AsyncStorage.setItem('finiax_goal_currency', goalCurrencyInput);
+      
       setIsEditingGoal(false);
     } catch (e) {
       Alert.alert('Error', 'No se pudo guardar la meta');
@@ -125,25 +272,50 @@ export default function AssetsScreen() {
       querySym = 'SBUX';
     }
     const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${querySym}.BA`;
-    
+
     // Intento 1: Fetch directo (por ejemplo en móvil o Node)
     try {
       const res = await fetch(targetUrl);
-      const data = await res.json();
-      if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
-        return Number(data.chart.result[0].meta.regularMarketPrice);
+      if (res.ok) {
+        const text = await res.text();
+        if (text && text.trim()) {
+          const data = JSON.parse(text);
+          if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
+            return Number(data.chart.result[0].meta.regularMarketPrice);
+          }
+        }
       }
     } catch (e) {
-      // Intento 2: Fallback por proxy CORS para navegadores web
+      // Intento 2: Fallback por corsproxy.io (Proxy rápido)
       try {
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
         const res = await fetch(proxyUrl);
-        const data = await res.json();
-        if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
-          return Number(data.chart.result[0].meta.regularMarketPrice);
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.trim()) {
+            const data = JSON.parse(text);
+            if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
+              return Number(data.chart.result[0].meta.regularMarketPrice);
+            }
+          }
         }
-      } catch (proxyError) {
-        console.warn(`No se pudo obtener el precio de la acción ${symbol}:`, proxyError);
+      } catch (proxyError1) {
+        // Intento 3: Fallback por allorigins.win (De respaldo)
+        try {
+          const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+          const res = await fetch(proxyUrl);
+          if (res.ok) {
+            const text = await res.text();
+            if (text && text.trim()) {
+              const data = JSON.parse(text);
+              if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
+                return Number(data.chart.result[0].meta.regularMarketPrice);
+              }
+            }
+          }
+        } catch (proxyError2) {
+          console.warn(`No se pudo obtener el precio de la acción ${symbol} tras probar múltiples proxies:`, proxyError2);
+        }
       }
     }
     return null;
@@ -174,26 +346,89 @@ export default function AssetsScreen() {
   const fetchExchangeRate = async () => {
     try {
       const res = await fetch('https://dolarapi.com/v1/dolares/ccl');
-      const data = await res.json();
-      if (data && data.venta) {
-        setExchangeRate(Number(data.venta));
+      if (res.ok) {
+        const text = await res.text();
+        if (text && text.trim()) {
+          const data = JSON.parse(text);
+          if (data && data.venta) {
+            setExchangeRate(Number(data.venta));
+          }
+        }
       }
     } catch (e) {
       console.warn('Error obteniendo dólar CCL, usando fallback 1350:', e);
     }
   };
 
+  const fetchAdditionalRates = async () => {
+    try {
+      // 1. Euro
+      try {
+        const res = await fetch('https://dolarapi.com/v1/dolares/euro');
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.trim()) {
+            const data = JSON.parse(text);
+            if (data && data.venta) {
+              setEurRate(Number(data.venta));
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Error fetching EUR/ARS rate:', e);
+      }
+
+      // 2. Real Brasilero
+      try {
+        const res = await fetch('https://open.er-api.com/v6/latest/BRL');
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.trim()) {
+            const data = JSON.parse(text);
+            if (data && data.rates && data.rates.ARS) {
+              setBrlRate(Number(data.rates.ARS));
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Error fetching BRL/ARS rate:', e);
+      }
+
+      // 3. Cryptos para visualización (BTC/USD y ETH/USD)
+      try {
+        const res = await fetch('https://min-api.cryptocompare.com/data/pricemulti?fsyms=BTC,ETH&tsyms=USD');
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.trim()) {
+            const data = JSON.parse(text);
+            if (data) {
+              if (data.BTC && data.BTC.USD) setBtcUsdPrice(Number(data.BTC.USD));
+              if (data.ETH && data.ETH.USD) setEthUsdPrice(Number(data.ETH.USD));
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Error fetching crypto display rates:', e);
+      }
+    } catch (e) {
+      console.warn('General error fetching additional rates:', e);
+    }
+  };
+
   const loadData = async () => {
     setLoading(true);
-    await fetchExchangeRate();
-    
+    await Promise.all([
+      fetchExchangeRate(),
+      fetchAdditionalRates()
+    ]);
+
     try {
       // 1. Cargar activos desde Supabase
       const { data: assetsData, error: assetsError } = await supabase
         .from('assets')
         .select('*')
         .eq('user_id', session!.user.id);
-      
+
       if (assetsError) throw assetsError;
       setRawAssets(assetsData || []);
 
@@ -331,6 +566,7 @@ export default function AssetsScreen() {
     setFormQuantity('');
     setFormPrice('');
     setFormInvestedCapital('');
+    setFormCurrency('ARS');
     setIsModalVisible(true);
   };
 
@@ -345,9 +581,12 @@ export default function AssetsScreen() {
 
     setEditingAsset(rawAsset);
     setFormName(rawAsset.name);
-    setFormSymbol(rawAsset.symbol);
+    setFormSymbol(getCleanSymbol(rawAsset.symbol));
     setFormType(rawAsset.type);
-    
+
+    const nativeCur = getAssetNativeCurrency(rawAsset.symbol);
+    setFormCurrency(nativeCur);
+
     if (rawAsset.type === 'fiat' || rawAsset.type === 'other') {
       // Reconstruir capital invertido real usando los valores puros de la base de datos
       const currentVal = rawAsset.quantity;
@@ -360,7 +599,7 @@ export default function AssetsScreen() {
       setFormPrice(String(rawAsset.average_buy_price));
       setFormInvestedCapital('');
     }
-    
+
     setIsModalVisible(true);
   };
 
@@ -393,6 +632,11 @@ export default function AssetsScreen() {
       }
     }
 
+    let finalSymbol = formSymbol.toUpperCase().trim();
+    if ((formType === 'fiat' || formType === 'other') && formCurrency !== 'ARS') {
+      finalSymbol = `${formCurrency}:${finalSymbol}`;
+    }
+
     try {
       if (editingAsset) {
         // ACTUALIZAR ACTIVO EXISTENTE
@@ -400,7 +644,7 @@ export default function AssetsScreen() {
           .from('assets')
           .update({
             name: formName,
-            symbol: formSymbol.toUpperCase().trim(),
+            symbol: finalSymbol,
             type: formType,
             quantity: qty,
             average_buy_price: avgPrice
@@ -416,7 +660,7 @@ export default function AssetsScreen() {
           .insert({
             user_id: session!.user.id,
             name: formName,
-            symbol: formSymbol.toUpperCase().trim(),
+            symbol: finalSymbol,
             type: formType,
             quantity: qty,
             average_buy_price: avgPrice
@@ -462,107 +706,124 @@ export default function AssetsScreen() {
   };
 
   // CÁLCULOS GENERALES DE VALORIZACIÓN
-  let totalPesos = 0;
-  let totalDollars = 0;
-  
+  let totalARS_Current = 0;
+  let totalARS_Invested = 0;
+
   // Agrupar activos en Pesos y Dólares
   const pesosAssetsList: any[] = [];
   const dollarsAssetsList: any[] = [];
 
   assets.forEach(asset => {
     const isUSD = isUSDAsset(asset.symbol, asset.name);
-    
-    // Valor invertido y actual
-    let investedVal = 0;
-    let currentVal = 0;
+    const { currentValueARS, investedValueARS } = convertAsset(asset);
 
-    if (asset.type === 'fiat' || asset.type === 'other') {
-      currentVal = asset.current_price === 1.0 ? asset.quantity : (asset.quantity * (asset.current_price || 0));
-      investedVal = asset.quantity * asset.average_buy_price;
-    } else {
-      currentVal = asset.quantity * (asset.current_price || asset.average_buy_price);
-      investedVal = asset.quantity * asset.average_buy_price;
-    }
+    totalARS_Current += currentValueARS;
+    totalARS_Invested += investedValueARS;
 
-    if (asset.is_mercado_pago) {
-      // Ajustar valor de MP
-      currentVal = asset.current_price || 0;
-      investedVal = asset.average_buy_price;
-    }
+    const profitValARS = currentValueARS - investedValueARS;
+    const profitPct = investedValueARS > 0 ? (profitValARS / investedValueARS) * 100 : 0;
 
-    // Para Mercado Pago calculamos el rendimiento basándonos en los montos bases de la base de datos (sin el descuento del préstamo)
-    const profitVal = asset.is_mercado_pago && asset.base_quantity !== undefined && asset.base_invested !== undefined
-      ? (asset.base_quantity - asset.base_invested)
-      : (currentVal - investedVal);
-    const profitPct = asset.is_mercado_pago && asset.base_invested !== undefined
-      ? (asset.base_invested > 0 ? (profitVal / asset.base_invested) * 100 : 0)
-      : (investedVal > 0 ? (profitVal / investedVal) * 100 : 0);
-    const unitPrice = asset.quantity > 0 ? (currentVal / asset.quantity) : 0;
+    // Convertir montos individuales a la moneda de visualización seleccionada
+    const dispCurrent = convertFromARS(currentValueARS, displayCurrency);
+    const dispInvested = convertFromARS(investedValueARS, displayCurrency);
+    const dispProfit = dispCurrent - dispInvested;
+    const dispUnitPrice = asset.quantity > 0 ? (dispCurrent / asset.quantity) : 0;
 
     const mapped = {
       ...asset,
-      currentValue: currentVal,
-      // Para Mercado Pago mostramos el invertido original puro en el listado para transparencia
-      investedValue: asset.is_mercado_pago && asset.base_invested !== undefined ? asset.base_invested : investedVal,
-      profit: profitVal,
+      currentValue: dispCurrent,
+      investedValue: dispInvested,
+      profit: dispProfit,
       profitPercentage: profitPct,
-      unitPrice: unitPrice
+      unitPrice: dispUnitPrice,
+      nativeCurrency: getAssetNativeCurrency(asset.symbol),
+      currentValueARS,
+      investedValueARS
     };
 
     if (isUSD) {
-      totalDollars += currentVal;
       dollarsAssetsList.push(mapped);
     } else {
-      totalPesos += currentVal;
       pesosAssetsList.push(mapped);
     }
   });
 
   // Capital Propiedades (Suma de Simplestate y activos de tipo 'other' en pesos convertidos a pesos)
-  let propertiesValuePesos = 0;
+  let propertiesValueARS = 0;
   assets.forEach(asset => {
-    const isUSD = isUSDAsset(asset.symbol, asset.name);
-    const value = asset.type === 'fiat' || asset.type === 'other' ? asset.quantity : (asset.quantity * (asset.current_price || asset.average_buy_price));
-    
+    const { currentValueARS } = convertAsset(asset);
     if (asset.symbol.toUpperCase() === 'SIMPLESTATE' || asset.type === 'other') {
-      if (isUSD) {
-        propertiesValuePesos += value * exchangeRate;
-      } else {
-        propertiesValuePesos += value;
-      }
+      propertiesValueARS += currentValueARS;
     }
   });
 
-  // Totales Integrales (Equivalentes en Pesos y USD)
-  const usdEquivalentePesos = totalDollars * exchangeRate; // Equivalente en pesos de activos en dólares
-  const patrimonioNetoPesos = totalPesos + usdEquivalentePesos - totalDebts; // Patrimonio Neto en Pesos (Activos Pesos + Activos Dólares a Pesos - Deudas)
-  const patrimonioNetoUSD = exchangeRate > 0 ? (patrimonioNetoPesos / exchangeRate) : 0;
-  const activosTotalesPesos = totalPesos + usdEquivalentePesos;
+  // Totales Integrales (Equivalentes en la divisa de visualización)
+  const patrimonioNetoARS = totalARS_Current - totalDebts;
+  const patrimonioNetoDisp = convertFromARS(patrimonioNetoARS, displayCurrency);
+  const patrimonioNetoUSD = convertFromARS(patrimonioNetoARS, 'USD');
+  const activosTotalesDisp = convertFromARS(totalARS_Current, displayCurrency);
+  const deudasTotalesDisp = convertFromARS(totalDebts, displayCurrency);
 
-  // Faltante a la Meta de Inversión
-  const missingToGoal = Math.max(0, investmentGoal - patrimonioNetoPesos);
-  const goalProgress = investmentGoal > 0 ? Math.min(100, (patrimonioNetoPesos / investmentGoal) * 100) : 0;
+  // Conversión de la meta a ARS según su moneda de configuración
+  let investmentGoalARS = investmentGoal;
+  if (goalCurrency === 'USD') investmentGoalARS = investmentGoal * exchangeRate;
+  else if (goalCurrency === 'EUR') investmentGoalARS = investmentGoal * eurRate;
+  else if (goalCurrency === 'BRL') investmentGoalARS = investmentGoal * brlRate;
+
+  // Faltante a la Meta de Inversión (en la moneda de la meta)
+  const patrimonioNetoInGoalCur = convertFromARS(patrimonioNetoARS, goalCurrency);
+  const missingToGoalInGoalCur = Math.max(0, investmentGoal - patrimonioNetoInGoalCur);
+  const goalProgress = investmentGoalARS > 0 ? Math.min(100, (patrimonioNetoARS / investmentGoalARS) * 100) : 0;
+
+  // Rendimiento real del portafolio actual (calculado por el mercado)
+  const totalProfitARS = totalARS_Current - totalARS_Invested;
+  const portfolioReturnRate = totalARS_Invested > 0 ? (totalProfitARS / totalARS_Invested) * 100 : 0;
+
+  // Interés Compuesto - Cálculo de tiempo
+  let compoundInterestTimeText = '';
+  if (patrimonioNetoARS >= investmentGoalARS) {
+    compoundInterestTimeText = '¡Meta alcanzada!';
+  } else if (patrimonioNetoARS <= 0) {
+    compoundInterestTimeText = 'Patrimonio nulo o negativo';
+  } else if (portfolioReturnRate <= 0) {
+    compoundInterestTimeText = 'No es posible proyectar sin un rendimiento positivo en tu portafolio actual';
+  } else {
+    const years = Math.log(investmentGoalARS / patrimonioNetoARS) / Math.log(1 + portfolioReturnRate / 100);
+    const wholeYears = Math.floor(years);
+    const months = Math.round((years - wholeYears) * 12);
+    
+    if (wholeYears === 0) {
+      compoundInterestTimeText = `${months} ${months === 1 ? 'mes' : 'meses'}`;
+    } else if (months === 0) {
+      compoundInterestTimeText = `${wholeYears} ${wholeYears === 1 ? 'año' : 'años'}`;
+    } else {
+      compoundInterestTimeText = `${wholeYears} ${wholeYears === 1 ? 'año' : 'años'} y ${months} ${months === 1 ? 'mes' : 'meses'}`;
+    }
+  }
+
+  const propertiesValueDisp = convertFromARS(propertiesValueARS, displayCurrency);
+  const liquidAssetsValueDisp = Math.max(0, activosTotalesDisp - propertiesValueDisp);
 
   // RENDERIZADOR DE CHART DATA
   // 1. Capital Neto (filtrando cantidades cero o negativas para evitar crashes en PieChart)
   const netCapitalData = [
     {
       name: 'Propiedades',
-      amount: propertiesValuePesos,
+      amount: propertiesValueDisp,
       color: '#3498DB',
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
     },
     {
       name: 'Activos Líquidos',
-      amount: Math.max(0, activosTotalesPesos - propertiesValuePesos),
+      amount: liquidAssetsValueDisp,
       color: '#00D09E',
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
     },
     {
       name: 'Deuda',
-      amount: totalDebts,
+      amount: deudasTotalesDisp,
       color: '#FF4C4C',
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
@@ -579,7 +840,7 @@ export default function AssetsScreen() {
       color: chartColors[index % chartColors.length],
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
-    })).sort((a, b) => b.amount - a.amount).slice(0, 8);
+    })).sort((a, b) => b.amount - a.amount);
 
   // 3. Activos en Dólares Chart Data
   const dollarsChartData = dollarsAssetsList
@@ -590,13 +851,25 @@ export default function AssetsScreen() {
       color: chartColors[index % chartColors.length],
       legendFontColor: '#A0A0A0',
       legendFontSize: 11
-    })).sort((a, b) => b.amount - a.amount).slice(0, 8);
+    })).sort((a, b) => b.amount - a.amount);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     await loadData();
     setRefreshing(false);
   }, [session]);
+
+  const formatDisplayValue = (val: number, target: DisplayCurrency = displayCurrency) => {
+    const option = DISPLAY_CURRENCY_OPTIONS.find(o => o.value === target);
+    const symbol = option ? option.symbol : '$';
+    
+    // Si es crypto (BTC/ETH), mostrar más decimales
+    if (target === 'BTC' || target === 'ETH') {
+      return `${symbol} ${formatNumber(val, 6)}`;
+    }
+    
+    return `${symbol} ${formatCurrency(val)}`;
+  };
 
   if (loading && !refreshing) {
     return (
@@ -607,24 +880,80 @@ export default function AssetsScreen() {
     );
   }
 
+  // Calcular subtotales para la etiqueta informativa
+  let totalARS_PesosOnly = 0;
+  let totalARS_USDOnly = 0;
+  assets.forEach(asset => {
+    const { currentValueARS } = convertAsset(asset);
+    if (isUSDAsset(asset.symbol, asset.name)) {
+      totalARS_USDOnly += currentValueARS;
+    } else {
+      totalARS_PesosOnly += currentValueARS;
+    }
+  });
+
   return (
-    <ScrollView 
+    <ScrollView
       style={styles.container}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#00D09E" />}
     >
       <View style={styles.headerRow}>
-        <Text style={styles.title}>Portafolio de Inversiones</Text>
-        <TouchableOpacity style={styles.addBtn} onPress={handleOpenAddModal}>
-          <FontAwesome name="plus" size={14} color="#000" />
-          <Text style={styles.addBtnText}>Añadir</Text>
-        </TouchableOpacity>
+        <Text style={styles.title}>Portafolio</Text>
+        <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', zIndex: 10 }}>
+          {/* Selector de divisa */}
+          <View style={{ position: 'relative', zIndex: 20 }}>
+            <TouchableOpacity 
+              style={styles.currencyBtn} 
+              onPress={() => setShowCurrencySelector(!showCurrencySelector)}
+            >
+              <FontAwesome name="money" size={13} color="#FFF" />
+              <Text style={styles.currencyBtnText}>{displayCurrency}</Text>
+              <FontAwesome name={showCurrencySelector ? "caret-up" : "caret-down"} size={10} color="#FFF" />
+            </TouchableOpacity>
+            
+            {showCurrencySelector && (
+              <View style={styles.currencyDropdown}>
+                {DISPLAY_CURRENCY_OPTIONS.map((opt) => (
+                  <TouchableOpacity
+                    key={opt.value}
+                    style={[
+                      styles.currencyOption,
+                      displayCurrency === opt.value && styles.currencyOptionActive
+                    ]}
+                    onPress={async () => {
+                      setDisplayCurrency(opt.value);
+                      setShowCurrencySelector(false);
+                      try {
+                        await AsyncStorage.setItem('finiax_display_currency', opt.value);
+                      } catch (e) {
+                        console.warn(e);
+                      }
+                    }}
+                  >
+                    <Text style={[
+                      styles.currencyOptionText,
+                      displayCurrency === opt.value && styles.currencyOptionTextActive
+                    ]}>
+                      {opt.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+          </View>
+
+          <TouchableOpacity style={styles.addBtn} onPress={handleOpenAddModal}>
+            <FontAwesome name="plus" size={14} color="#000" />
+            <Text style={styles.addBtnText}>Añadir</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* TARJETAS DE PATRIMONIO NETO INTEGRAL */}
       <View style={styles.totalCard}>
         <Text style={styles.totalLabel}>PATRIMONIO NETO TOTAL</Text>
-        <Text style={styles.totalValue}>${formatCurrency(patrimonioNetoPesos)} ARS</Text>
-        <Text style={styles.totalSubValue}>u$s {formatCurrency(patrimonioNetoUSD)} USD</Text>
+        <Text style={styles.totalValue}>{formatDisplayValue(patrimonioNetoDisp)}</Text>
+        <Text style={styles.totalSubValue}>{formatDisplayValue(patrimonioNetoUSD, 'USD')}</Text>
         <View style={styles.cclBadge}>
           <Text style={styles.cclText}>Cotización Dólar CCL: ${formatCurrency(exchangeRate)}</Text>
         </View>
@@ -633,12 +962,12 @@ export default function AssetsScreen() {
       <View style={styles.statsContainer}>
         <View style={[styles.statCard, { borderLeftColor: '#00D09E', borderLeftWidth: 4 }]}>
           <Text style={styles.statLabel}>Activos Totales</Text>
-          <Text style={styles.statValue}>${formatCurrency(activosTotalesPesos)}</Text>
-          <Text style={styles.statSubValue}>Pesos: ${formatCurrency(totalPesos)} | USD: u$s {formatCurrency(totalDollars)}</Text>
+          <Text style={styles.statValue}>{formatDisplayValue(activosTotalesDisp)}</Text>
+          <Text style={styles.statSubValue}>ARS: ${formatCurrency(totalARS_PesosOnly)} | USD: u$s {formatCurrency(totalARS_USDOnly / exchangeRate)}</Text>
         </View>
         <View style={[styles.statCard, { borderLeftColor: '#FF4C4C', borderLeftWidth: 4 }]}>
           <Text style={styles.statLabel}>Deuda Pasiva</Text>
-          <Text style={[styles.statValue, { color: '#FF4C4C' }]}>-${formatCurrency(totalDebts)}</Text>
+          <Text style={[styles.statValue, { color: '#FF4C4C' }]}>-{formatDisplayValue(deudasTotalesDisp)}</Text>
           <Text style={styles.statSubValue}>Cuotas e intereses pendientes</Text>
         </View>
       </View>
@@ -647,113 +976,243 @@ export default function AssetsScreen() {
       <View style={styles.goalCard}>
         <View style={styles.goalHeader}>
           <Text style={styles.goalTitle}>Meta / Objetivo Financiero</Text>
-          {isEditingGoal ? (
-            <View style={styles.editingGoalRow}>
-              <TextInput 
-                style={styles.goalInput}
-                value={goalInput}
-                onChangeText={setGoalInput}
-                keyboardType="numeric"
-                placeholder="Meta en Pesos"
-                placeholderTextColor="#888"
-              />
-              <TouchableOpacity style={styles.goalSaveBtn} onPress={handleSaveGoal}>
-                <FontAwesome name="check" size={12} color="#000" />
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.goalSaveBtn, { backgroundColor: '#444' }]} onPress={() => setIsEditingGoal(false)}>
-                <FontAwesome name="times" size={12} color="#FFF" />
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <TouchableOpacity 
-              style={styles.editGoalBtn} 
+          {!isEditingGoal && (
+            <TouchableOpacity
+              style={styles.editGoalBtn}
               onPress={() => {
                 setGoalInput(String(investmentGoal));
+                setGoalCurrencyInput(goalCurrency);
                 setIsEditingGoal(true);
               }}
             >
-              <Text style={styles.goalValueText}>Meta: ${formatCurrency(investmentGoal)}</Text>
-              <FontAwesome name="pencil" size={12} color="#FFD700" style={{ marginLeft: 8 }} />
+              <FontAwesome name="pencil" size={12} color="#FFD700" style={{ marginRight: 6 }} />
+              <Text style={styles.goalValueText}>Editar Meta</Text>
             </TouchableOpacity>
           )}
         </View>
 
-        {/* Barra de Progreso de la Meta */}
-        <View style={styles.goalProgressSection}>
-          <View style={styles.goalProgressLabels}>
-            <Text style={styles.goalProgressText}>Progreso a Meta</Text>
-            <Text style={styles.goalProgressPct}>{formatNumber(goalProgress, 2)}%</Text>
+        {isEditingGoal ? (
+          <View style={{ gap: 10, marginTop: 4 }}>
+            <Text style={styles.inputLabel}>Monto de la Meta</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={goalInput}
+              onChangeText={setGoalInput}
+              keyboardType="numeric"
+              placeholder="Monto"
+              placeholderTextColor="#888"
+            />
+
+            <Text style={styles.inputLabel}>Moneda de la Meta</Text>
+            <View style={styles.typeSelectorRow}>
+              {NATIVE_CURRENCY_OPTIONS.map((opt) => (
+                <TouchableOpacity
+                  key={opt.value}
+                  style={[styles.typeSelectBtn, goalCurrencyInput === opt.value && styles.typeSelectBtnActive]}
+                  onPress={() => setGoalCurrencyInput(opt.value)}
+                >
+                  <Text style={[styles.typeSelectText, goalCurrencyInput === opt.value && styles.typeSelectTextActive]}>
+                    {opt.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
+              <TouchableOpacity style={[styles.saveBtn, { flex: 1, marginTop: 0 }]} onPress={handleSaveGoal}>
+                <Text style={styles.saveBtnText}>Guardar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.saveBtn, { flex: 1, backgroundColor: '#444', marginTop: 0 }]} onPress={() => setIsEditingGoal(false)}>
+                <Text style={[styles.saveBtnText, { color: '#FFF' }]}>Cancelar</Text>
+              </TouchableOpacity>
+            </View>
           </View>
-          <View style={styles.goalProgressBarBg}>
-            <View style={[styles.goalProgressBarFill, { width: `${goalProgress}%` }]} />
+        ) : (
+          <View style={styles.goalProgressSection}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+              <Text style={{ color: '#FFF', fontSize: 15, fontWeight: 'bold' }}>
+                Meta: {formatDisplayValue(investmentGoal, goalCurrency)}
+              </Text>
+              <Text style={styles.goalProgressPct}>{formatNumber(goalProgress, 2)}%</Text>
+            </View>
+            <View style={styles.goalProgressBarBg}>
+              <View style={[styles.goalProgressBarFill, { width: `${goalProgress}%` }]} />
+            </View>
+            <View style={[styles.missingBox, { marginTop: 12 }]}>
+              <Text style={styles.missingText}>Faltante para alcanzar meta:</Text>
+              <Text style={styles.missingValue}>{formatDisplayValue(missingToGoalInGoalCur, goalCurrency)}</Text>
+            </View>
+
+            <View style={{ marginTop: 12, borderTopWidth: 1, borderTopColor: '#222', paddingTop: 10 }}>
+              <Text style={{ color: '#888', fontSize: 11, lineHeight: 16 }}>
+                <FontAwesome name="hourglass-half" size={10} color="#FFD700" /> Proyección sin aportes (Interés Compuesto al {formatNumber(portfolioReturnRate, 2)}% basado en tus activos):
+              </Text>
+              <Text style={{ color: '#FFF', fontSize: 13, fontWeight: 'bold', marginTop: 4 }}>
+                {patrimonioNetoARS >= investmentGoalARS ? '¡Meta alcanzada!' : `${compoundInterestTimeText}`}
+              </Text>
+            </View>
           </View>
-          <View style={styles.missingBox}>
-            <Text style={styles.missingText}>Faltante para alcanzar meta:</Text>
-            <Text style={styles.missingValue}>${formatCurrency(missingToGoal)} ARS</Text>
-          </View>
-        </View>
+        )}
       </View>
 
       {/* SECCIÓN DE GRÁFICOS DE RENDIMIENTO */}
       <View style={styles.chartsCard}>
-        <Text style={styles.sectionTitle}>Distribución y Rendimiento de Inversiones</Text>
-        
-        {/* Gráfico 1: Capital Neto */}
-        {netCapitalData.length > 0 ? (
-          <View style={styles.chartBlock}>
-            <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
-            <PieChart
-              data={netCapitalData}
-              width={chartWidth - 16}
-              height={160}
-              chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
-              accessor={"amount"}
-              backgroundColor={"transparent"}
-              paddingLeft={"0"}
-              center={[chartWidth / 6, 0]}
-              hasLegend={true}
-            />
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <Text style={[styles.sectionTitle, { marginBottom: 0 }]}>Distribución y Rendimiento de Inversiones</Text>
+          
+          {/* Selector de tipo de visualización */}
+          <View style={styles.viewToggleContainer}>
+            <TouchableOpacity 
+              style={[styles.viewToggleBtn, !showListView && styles.viewToggleBtnActive]} 
+              onPress={() => setShowListView(false)}
+            >
+              <FontAwesome name="pie-chart" size={11} color={!showListView ? '#000' : '#888'} />
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.viewToggleBtn, showListView && styles.viewToggleBtnActive]} 
+              onPress={() => setShowListView(true)}
+            >
+              <FontAwesome name="align-left" size={11} color={showListView ? '#000' : '#888'} />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {showListView ? (
+          /* Renderizado como Lista de Barras Horizontales Ordenada */
+          <View style={{ gap: 16 }}>
+            {/* Composición de Capital Neto */}
+            <View>
+              <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
+              {netCapitalData.map((item, idx) => {
+                const total = netCapitalData.reduce((acc, c) => acc + c.amount, 0);
+                const pct = total > 0 ? (item.amount / total) * 100 : 0;
+                return (
+                  <View key={idx} style={{ marginBottom: 8 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <Text style={{ color: '#FFF', fontSize: 11 }}>{item.name}</Text>
+                      <Text style={{ color: '#888', fontSize: 11 }}>{formatDisplayValue(item.amount)} ({pct.toFixed(1)}%)</Text>
+                    </View>
+                    <View style={{ height: 6, backgroundColor: '#222', borderRadius: 3, overflow: 'hidden' }}>
+                      <View style={{ height: '100%', width: `${pct}%`, backgroundColor: item.color, borderRadius: 3 }} />
+                    </View>
+                  </View>
+                );
+              })}
+            </View>
+
+            {/* Distribución de Activos en Pesos (Completo sin esconder ninguno) */}
+            {pesosAssetsList.length > 0 && (
+              <View style={{ borderTopWidth: 1, borderTopColor: '#2E2E2E', paddingTop: 16 }}>
+                <Text style={styles.chartTitle}>Distribución de Activos en Pesos (ARS)</Text>
+                {(() => {
+                  const sortedList = [...pesosAssetsList].sort((a, b) => b.currentValue - a.currentValue);
+                  const total = sortedList.reduce((acc, a) => acc + a.currentValue, 0);
+
+                  return sortedList.map((item, idx) => {
+                    const pct = total > 0 ? (item.currentValue / total) * 100 : 0;
+                    return (
+                      <View key={idx} style={{ marginBottom: 8 }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                          <Text style={{ color: '#FFF', fontSize: 11, fontWeight: 'bold' }}>{item.symbol}</Text>
+                          <Text style={{ color: '#888', fontSize: 11 }}>{formatDisplayValue(item.currentValue)} ({pct.toFixed(1)}%)</Text>
+                        </View>
+                        <View style={{ height: 6, backgroundColor: '#222', borderRadius: 3, overflow: 'hidden' }}>
+                          <View style={{ height: '100%', width: `${pct}%`, backgroundColor: item.color || chartColors[idx % chartColors.length], borderRadius: 3 }} />
+                        </View>
+                      </View>
+                    );
+                  });
+                })()}
+              </View>
+            )}
+
+            {/* Distribución de Activos en Dólares (Completo sin esconder ninguno) */}
+            {dollarsAssetsList.length > 0 && (
+              <View style={{ borderTopWidth: 1, borderTopColor: '#2E2E2E', paddingTop: 16 }}>
+                <Text style={styles.chartTitle}>Distribución de Activos en Dólares (USD)</Text>
+                {(() => {
+                  const sortedList = [...dollarsAssetsList].sort((a, b) => b.currentValue - a.currentValue);
+                  const total = sortedList.reduce((acc, a) => acc + a.currentValue, 0);
+
+                  return sortedList.map((item, idx) => {
+                    const pct = total > 0 ? (item.currentValue / total) * 100 : 0;
+                    return (
+                      <View key={idx} style={{ marginBottom: 8 }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                          <Text style={{ color: '#FFF', fontSize: 11, fontWeight: 'bold' }}>{item.symbol}</Text>
+                          <Text style={{ color: '#888', fontSize: 11 }}>{formatDisplayValue(item.currentValue)} ({pct.toFixed(1)}%)</Text>
+                        </View>
+                        <View style={{ height: 6, backgroundColor: '#222', borderRadius: 3, overflow: 'hidden' }}>
+                          <View style={{ height: '100%', width: `${pct}%`, backgroundColor: item.color || chartColors[idx % chartColors.length], borderRadius: 3 }} />
+                        </View>
+                      </View>
+                    );
+                  });
+                })()}
+              </View>
+            )}
           </View>
         ) : (
-          <View style={styles.chartBlock}>
-            <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
-            <Text style={{ color: '#666', fontSize: 12, marginVertical: 40, textAlign: 'center' }}>No hay datos suficientes para mostrar la distribución</Text>
-          </View>
-        )}
+          /* Renderizado como Gráfico de Torta Clásico */
+          <View>
+            {/* Gráfico 1: Capital Neto */}
+            {netCapitalData.length > 0 ? (
+              <View style={styles.chartBlock}>
+                <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
+                <PieChart
+                  data={netCapitalData}
+                  width={chartWidth - 16}
+                  height={160}
+                  chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
+                  accessor={"amount"}
+                  backgroundColor={"transparent"}
+                  paddingLeft={"0"}
+                  center={[chartWidth / 6, 0]}
+                  hasLegend={true}
+                />
+              </View>
+            ) : (
+              <View style={styles.chartBlock}>
+                <Text style={styles.chartTitle}>Composición de Capital Neto</Text>
+                <Text style={{ color: '#666', fontSize: 12, marginVertical: 40, textAlign: 'center' }}>No hay datos suficientes para mostrar la distribución</Text>
+              </View>
+            )}
 
-        {/* Gráfico 2: Activos en Pesos */}
-        {pesosChartData.length > 0 && (
-          <View style={styles.chartBlock}>
-            <Text style={styles.chartTitle}>Distribución de Activos en Pesos</Text>
-            <PieChart
-              data={pesosChartData}
-              width={chartWidth - 16}
-              height={160}
-              chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
-              accessor={"amount"}
-              backgroundColor={"transparent"}
-              paddingLeft={"0"}
-              center={[chartWidth / 6, 0]}
-              hasLegend={true}
-            />
-          </View>
-        )}
+            {/* Gráfico 2: Activos en Pesos */}
+            {pesosChartData.length > 0 && (
+              <View style={styles.chartBlock}>
+                <Text style={styles.chartTitle}>Distribución de Activos en Pesos</Text>
+                <PieChart
+                  data={pesosChartData}
+                  width={chartWidth - 16}
+                  height={160}
+                  chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
+                  accessor={"amount"}
+                  backgroundColor={"transparent"}
+                  paddingLeft={"0"}
+                  center={[chartWidth / 6, 0]}
+                  hasLegend={true}
+                />
+              </View>
+            )}
 
-        {/* Gráfico 3: Activos en Dólares */}
-        {dollarsChartData.length > 0 && (
-          <View style={styles.chartBlock}>
-            <Text style={styles.chartTitle}>Distribución de Activos en Dólares</Text>
-            <PieChart
-              data={dollarsChartData}
-              width={chartWidth - 16}
-              height={160}
-              chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
-              accessor={"amount"}
-              backgroundColor={"transparent"}
-              paddingLeft={"0"}
-              center={[chartWidth / 6, 0]}
-              hasLegend={true}
-            />
+            {/* Gráfico 3: Activos en Dólares */}
+            {dollarsChartData.length > 0 && (
+              <View style={styles.chartBlock}>
+                <Text style={styles.chartTitle}>Distribución de Activos en Dólares</Text>
+                <PieChart
+                  data={dollarsChartData}
+                  width={chartWidth - 16}
+                  height={160}
+                  chartConfig={{ color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})` }}
+                  accessor={"amount"}
+                  backgroundColor={"transparent"}
+                  paddingLeft={"0"}
+                  center={[chartWidth / 6, 0]}
+                  hasLegend={true}
+                />
+              </View>
+            )}
           </View>
         )}
       </View>
@@ -764,25 +1223,32 @@ export default function AssetsScreen() {
         <View style={styles.assetsList}>
           {pesosAssetsList.map((asset) => {
             const isPositive = asset.profit >= 0;
+            const cleanSym = getCleanSymbol(asset.symbol);
+            const nativeCur = getAssetNativeCurrency(asset.symbol);
             return (
               <TouchableOpacity key={asset.id} style={styles.assetItemCard} onPress={() => handleOpenEditModal(asset)}>
                 <View style={styles.assetItemHeader}>
                   <View style={styles.assetItemLeft}>
                     <View style={[styles.assetIconBox, { backgroundColor: asset.is_autoprestamo ? 'rgba(255, 215, 0, 0.1)' : 'rgba(0, 208, 158, 0.1)' }]}>
-                      <FontAwesome 
-                        name={asset.is_autoprestamo ? 'bank' : (asset.type === 'stock' ? 'line-chart' : 'money')} 
-                        size={14} 
-                        color={asset.is_autoprestamo ? '#FFD700' : '#00D09E'} 
+                      <FontAwesome
+                        name={asset.is_autoprestamo ? 'bank' : (asset.type === 'stock' ? 'line-chart' : 'money')}
+                        size={14}
+                        color={asset.is_autoprestamo ? '#FFD700' : '#00D09E'}
                       />
                     </View>
                     <View style={{ marginLeft: 10, flex: 1 }}>
-                      <Text style={styles.assetItemSymbol} numberOfLines={1}>{asset.symbol}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={styles.assetItemSymbol} numberOfLines={1}>{cleanSym}</Text>
+                        <View style={styles.nativeCurrencyPill}>
+                          <Text style={styles.nativeCurrencyPillText}>{nativeCur}</Text>
+                        </View>
+                      </View>
                       <Text style={styles.assetItemName} numberOfLines={1}>{asset.name}</Text>
                     </View>
                   </View>
                   <View style={styles.assetItemRight}>
-                    <Text style={styles.assetItemValue}>${formatCurrency(asset.currentValue)}</Text>
-                    <Text style={styles.assetItemUnitPrice}>Cant: {formatNumber(asset.quantity, 2)} | u: ${formatCurrency(asset.unitPrice)}</Text>
+                    <Text style={styles.assetItemValue}>{formatDisplayValue(asset.currentValue)}</Text>
+                    <Text style={styles.assetItemUnitPrice}>Cant: {formatNumber(asset.quantity, 2)} | u: {formatDisplayValue(asset.unitPrice)}</Text>
                   </View>
                 </View>
 
@@ -799,14 +1265,14 @@ export default function AssetsScreen() {
                     </View>
                   </View>
                 )}
-                
+
                 {/* Diferencia / Rendimiento */}
                 <View style={styles.assetItemFooter}>
-                  <Text style={styles.investedLabel}>Invertido: ${formatCurrency(asset.investedValue)}</Text>
+                  <Text style={styles.investedLabel}>Invertido: {formatDisplayValue(asset.investedValue)}</Text>
                   <View style={[styles.profitBadge, { backgroundColor: isPositive ? 'rgba(0, 208, 158, 0.15)' : 'rgba(255, 76, 76, 0.15)' }]}>
                     <FontAwesome name={isPositive ? 'caret-up' : 'caret-down'} size={10} color={isPositive ? '#00D09E' : '#FF4C4C'} />
                     <Text style={[styles.profitTextValue, { color: isPositive ? '#00D09E' : '#FF4C4C' }]}>
-                      {isPositive ? '+' : ''}${formatCurrency(asset.profit)} ({formatNumber(asset.profitPercentage, 2)}%)
+                      {isPositive ? '+' : ''}{formatDisplayValue(asset.profit)} ({formatNumber(asset.profitPercentage, 2)}%)
                     </Text>
                   </View>
                 </View>
@@ -821,40 +1287,47 @@ export default function AssetsScreen() {
       )}
 
       {/* LISTADO DE ACTIVOS EN DÓLARES */}
-      <Text style={styles.tableSectionTitle}>Activos en Dólares (USD)</Text>
+      <Text style={styles.tableSectionTitle}>Activos en Moneda Extranjera / Hard Assets</Text>
       {dollarsAssetsList.length > 0 ? (
         <View style={styles.assetsList}>
           {dollarsAssetsList.map((asset) => {
             const isPositive = asset.profit >= 0;
+            const cleanSym = getCleanSymbol(asset.symbol);
+            const nativeCur = getAssetNativeCurrency(asset.symbol);
             return (
               <TouchableOpacity key={asset.id} style={styles.assetItemCard} onPress={() => handleOpenEditModal(asset)}>
                 <View style={styles.assetItemHeader}>
                   <View style={styles.assetItemLeft}>
                     <View style={[styles.assetIconBox, { backgroundColor: 'rgba(52, 152, 219, 0.1)' }]}>
-                      <FontAwesome 
-                        name={asset.type === 'crypto' ? 'bitcoin' : 'globe'} 
-                        size={14} 
-                        color="#3498DB" 
+                      <FontAwesome
+                        name={asset.type === 'crypto' ? 'bitcoin' : 'globe'}
+                        size={14}
+                        color="#3498DB"
                       />
                     </View>
                     <View style={{ marginLeft: 10, flex: 1 }}>
-                      <Text style={styles.assetItemSymbol} numberOfLines={1}>{asset.symbol}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={styles.assetItemSymbol} numberOfLines={1}>{cleanSym}</Text>
+                        <View style={[styles.nativeCurrencyPill, { backgroundColor: 'rgba(52, 152, 219, 0.15)' }]}>
+                          <Text style={[styles.nativeCurrencyPillText, { color: '#3498DB' }]}>{nativeCur}</Text>
+                        </View>
+                      </View>
                       <Text style={styles.assetItemName} numberOfLines={1}>{asset.name}</Text>
                     </View>
                   </View>
                   <View style={styles.assetItemRight}>
-                    <Text style={styles.assetItemValue}>u$s {formatCurrency(asset.currentValue)}</Text>
-                    <Text style={styles.assetItemUnitPrice}>Cant: {formatNumber(asset.quantity, 6)} | u: u$s {formatCurrency(asset.unitPrice)}</Text>
+                    <Text style={styles.assetItemValue}>{formatDisplayValue(asset.currentValue)}</Text>
+                    <Text style={styles.assetItemUnitPrice}>Cant: {formatNumber(asset.quantity, 6)} | u: {formatDisplayValue(asset.unitPrice)}</Text>
                   </View>
                 </View>
-                
+
                 {/* Diferencia / Rendimiento */}
                 <View style={styles.assetItemFooter}>
-                  <Text style={styles.investedLabel}>Invertido: u$s {formatCurrency(asset.investedValue)}</Text>
+                  <Text style={styles.investedLabel}>Invertido: {formatDisplayValue(asset.investedValue)}</Text>
                   <View style={[styles.profitBadge, { backgroundColor: isPositive ? 'rgba(0, 208, 158, 0.15)' : 'rgba(255, 76, 76, 0.15)' }]}>
                     <FontAwesome name={isPositive ? 'caret-up' : 'caret-down'} size={10} color={isPositive ? '#00D09E' : '#FF4C4C'} />
                     <Text style={[styles.profitTextValue, { color: isPositive ? '#00D09E' : '#FF4C4C' }]}>
-                      {isPositive ? '+' : ''}u$s {formatCurrency(asset.profit)} ({formatNumber(asset.profitPercentage, 2)}%)
+                      {isPositive ? '+' : ''}{formatDisplayValue(asset.profit)} ({formatNumber(asset.profitPercentage, 2)}%)
                     </Text>
                   </View>
                 </View>
@@ -864,7 +1337,7 @@ export default function AssetsScreen() {
         </View>
       ) : (
         <View style={styles.emptyCard}>
-          <Text style={{ color: '#888', fontStyle: 'italic' }}>No tienes activos en dólares registrados.</Text>
+          <Text style={{ color: '#888', fontStyle: 'italic' }}>No tienes activos extranjeros registrados.</Text>
         </View>
       )}
 
@@ -921,20 +1394,35 @@ export default function AssetsScreen() {
               {/* Mostrar campos diferentes si es Fondo/Cash Manual */}
               {formType === 'fiat' || formType === 'other' ? (
                 <>
-                  <Text style={styles.inputLabel}>Capital Invertido Original (Pesos/Dólares)</Text>
+                  <Text style={styles.inputLabel}>Moneda Base del Activo</Text>
+                  <View style={styles.typeSelectorRow}>
+                    {NATIVE_CURRENCY_OPTIONS.map((opt) => (
+                      <TouchableOpacity
+                        key={opt.value}
+                        style={[styles.typeSelectBtn, formCurrency === opt.value && styles.typeSelectBtnActive]}
+                        onPress={() => setFormCurrency(opt.value)}
+                      >
+                        <Text style={[styles.typeSelectText, formCurrency === opt.value && styles.typeSelectTextActive]}>
+                          {opt.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+
+                  <Text style={styles.inputLabel}>Capital Invertido Original ({formCurrency})</Text>
                   <TextInput
                     style={styles.modalInput}
-                    placeholder="ej. 1230352.76"
+                    placeholder="ej. 1000.00"
                     placeholderTextColor="#666"
                     value={formInvestedCapital}
                     onChangeText={setFormInvestedCapital}
                     keyboardType="numeric"
                   />
 
-                  <Text style={styles.inputLabel}>Saldo / Valor Actual del Fondo</Text>
+                  <Text style={styles.inputLabel}>Saldo / Valor Actual del Fondo ({formCurrency})</Text>
                   <TextInput
                     style={styles.modalInput}
-                    placeholder="ej. 1231524.54"
+                    placeholder="ej. 1050.00"
                     placeholderTextColor="#666"
                     value={formQuantity}
                     onChangeText={setFormQuantity}
@@ -972,10 +1460,11 @@ export default function AssetsScreen() {
                 if (isNaN(invested) || isNaN(current) || invested <= 0) return null;
                 const diff = current - invested;
                 const pct = (diff / invested) * 100;
+                const symbol = formCurrency === 'USD' ? 'u$s' : formCurrency === 'EUR' ? '€' : formCurrency === 'BRL' ? 'R$' : '$';
                 return (
                   <View style={[styles.modalProfitBadge, { backgroundColor: diff >= 0 ? 'rgba(0, 208, 158, 0.15)' : 'rgba(255, 76, 76, 0.15)' }]}>
                     <Text style={[styles.modalProfitText, { color: diff >= 0 ? '#00D09E' : '#FF4C4C' }]}>
-                      Actualización: {diff >= 0 ? 'Subió ▲' : 'Bajó ▼'} {diff >= 0 ? '+' : ''}${formatCurrency(diff)} ({formatNumber(pct, 2)}%)
+                      Actualización: {diff >= 0 ? 'Subió ▲' : 'Bajó ▼'} {diff >= 0 ? '+' : ''}{symbol} {formatCurrency(diff)} ({formatNumber(pct, 2)}%)
                     </Text>
                   </View>
                 );
@@ -986,8 +1475,8 @@ export default function AssetsScreen() {
               </TouchableOpacity>
 
               {editingAsset && (
-                <TouchableOpacity 
-                  style={[styles.saveBtn, { backgroundColor: '#FF4C4C', marginTop: 8 }]} 
+                <TouchableOpacity
+                  style={[styles.saveBtn, { backgroundColor: '#FF4C4C', marginTop: 8 }]}
                   onPress={() => handleDeleteAsset(editingAsset.id)}
                 >
                   <Text style={[styles.saveBtnText, { color: '#FFF' }]}>Eliminar Activo</Text>
@@ -1006,8 +1495,8 @@ export default function AssetsScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0A0A0A', padding: 24 },
   centered: { flex: 1, backgroundColor: '#0A0A0A', justifyContent: 'center', alignItems: 'center' },
-  
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
+
+  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, zIndex: 100, position: 'relative' },
   title: { fontSize: 22, fontWeight: 'bold', color: '#FFF' },
   addBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#00D09E', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, gap: 6 },
   addBtnText: { color: '#000', fontSize: 13, fontWeight: 'bold' },
@@ -1036,8 +1525,8 @@ const styles = StyleSheet.create({
   editingGoalRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   goalInput: { backgroundColor: '#111', color: '#FFF', borderRadius: 6, borderWidth: 1, borderColor: '#444', paddingHorizontal: 8, paddingVertical: 4, width: 100, fontSize: 12 },
   goalSaveBtn: { backgroundColor: '#FFD700', width: 26, height: 26, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
-  
-  goalProgressSection: { },
+
+  goalProgressSection: {},
   goalProgressLabels: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
   goalProgressText: { color: '#888', fontSize: 11 },
   goalProgressPct: { color: '#FFD700', fontSize: 11, fontWeight: 'bold' },
@@ -1065,7 +1554,7 @@ const styles = StyleSheet.create({
   assetItemRight: { alignItems: 'flex-end', marginLeft: 12 },
   assetItemValue: { color: '#FFF', fontSize: 14, fontWeight: 'bold' },
   assetItemUnitPrice: { color: '#666', fontSize: 11, marginTop: 2 },
-  
+
   assetItemFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#222' },
   investedLabel: { color: '#888', fontSize: 11 },
   profitBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
@@ -1094,4 +1583,19 @@ const styles = StyleSheet.create({
   mpBreakdownRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   mpBreakdownLabel: { color: '#666', fontSize: 12 },
   mpBreakdownValue: { color: '#FFF', fontSize: 12, fontWeight: 'bold' },
+
+  // Estilos de Selector de Moneda y Pills
+  currencyBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#222', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, gap: 6, borderWidth: 1, borderColor: '#333' },
+  currencyBtnText: { color: '#FFF', fontSize: 13, fontWeight: 'bold' },
+  currencyDropdown: { position: 'absolute', top: 38, right: 0, backgroundColor: '#1E1E1E', borderRadius: 8, padding: 4, borderWidth: 1, borderColor: '#333', width: 140, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 4, elevation: 5, zIndex: 1000 },
+  currencyOption: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6 },
+  currencyOptionActive: { backgroundColor: 'rgba(0, 208, 158, 0.15)' },
+  currencyOptionText: { color: '#AAA', fontSize: 12 },
+  currencyOptionTextActive: { color: '#00D09E', fontWeight: 'bold' },
+  nativeCurrencyPill: { backgroundColor: 'rgba(0, 208, 158, 0.15)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  nativeCurrencyPillText: { color: '#00D09E', fontSize: 9, fontWeight: 'bold' },
+
+  viewToggleContainer: { flexDirection: 'row', backgroundColor: '#222', borderRadius: 8, padding: 3, borderWidth: 1, borderColor: '#333' },
+  viewToggleBtn: { width: 28, height: 24, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
+  viewToggleBtnActive: { backgroundColor: '#FFD700' }
 });

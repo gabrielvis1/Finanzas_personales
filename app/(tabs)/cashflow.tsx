@@ -311,11 +311,29 @@ export default function CashFlowScreen() {
       }
 
       // Procesar Pagos de Deuda
-      if (category.startsWith('Pago: ')) {
-        const creditLineName = category.replace('Pago: ', '');
-        const cl = creditLines.find(c => c.name === creditLineName);
+      const catLower = category.toLowerCase().trim();
+      const isPagoDeudaCategory = catLower === 'pago de deuda' || catLower.startsWith('pago:') || catLower.startsWith('pago ');
+      if (type === 'expense' && isPagoDeudaCategory) {
+        let creditLineName = '';
+        if (catLower.startsWith('pago:')) {
+          creditLineName = category.substring(5).trim();
+        } else if (catLower.startsWith('pago de ')) {
+          creditLineName = category.substring(8).trim();
+        } else if (catLower.startsWith('pago ')) {
+          creditLineName = category.substring(5).trim();
+        }
+
+        console.log("=== PROCESAR PAGO DE DEUDA ===");
+        console.log("Categoría:", category);
+        console.log("Credit Line Name inferred:", creditLineName);
+        let cl = creditLines.find(c => c.name.toLowerCase().trim() === creditLineName.toLowerCase().trim());
+        if (!cl) {
+          const searchStr = `${name} ${description}`.toLowerCase();
+          cl = creditLines.find(c => searchStr.includes(c.name.toLowerCase().trim()));
+        }
+        console.log("Credit Line found:", cl);
         if (cl) {
-          const { data: pendingInst } = await supabase.from('debt_installments')
+          const { data: pendingInst, error: fetchErr } = await supabase.from('debt_installments')
             .select('*')
             .eq('user_id', session.user.id)
             .eq('credit_line_id', cl.id)
@@ -324,20 +342,47 @@ export default function CashFlowScreen() {
             .order('month', {ascending: true})
             .order('installment_number', {ascending: true});
             
+          if (fetchErr) {
+            console.error("Error fetching installments:", fetchErr);
+          }
+          console.log("Pending installments in DB:", pendingInst);
           if (pendingInst && pendingInst.length > 0) {
-             let paymentLeft = Number(amount);
-             let paidCount = 0;
-             for (const inst of pendingInst) {
-                if (paymentLeft >= Number(inst.amount) - 1) { // -1 para margen de redondeo
-                   await supabase.from('debt_installments').update({ status: 'paid' }).eq('id', inst.id);
-                   paymentLeft -= Number(inst.amount);
-                   paidCount++;
+             const txDate = new Date(transactionData.date);
+             const txMonth = txDate.getMonth() + 1;
+             const txYear = txDate.getFullYear();
+             console.log("txMonth:", txMonth, "txYear:", txYear);
+ 
+             // Filtrar para imputar el pago únicamente a cuotas del mes de la transacción o anteriores
+             const eligibleInst = pendingInst.filter(inst => 
+               inst.year < txYear || (inst.year === txYear && inst.month <= txMonth)
+             );
+             console.log("Eligible installments for month:", eligibleInst);
+ 
+             if (eligibleInst.length > 0) {
+                let paymentLeft = Number(amount);
+                let paidCount = 0;
+                for (const inst of eligibleInst) {
+                   console.log(`Checking inst amount: ${inst.amount}, paymentLeft: ${paymentLeft}`);
+                   if (paymentLeft >= Number(inst.amount) - 1) { // -1 para margen de redondeo
+                      const { error: updErr } = await supabase.from('debt_installments').update({ status: 'paid' }).eq('id', inst.id);
+                      if (updErr) {
+                        console.error("Error updating installment status to paid:", updErr);
+                      } else {
+                        console.log(`Updated installment ${inst.id} to paid`);
+                        paymentLeft -= Number(inst.amount);
+                        paidCount++;
+                      }
+                   }
                 }
-             }
-             if (paidCount > 0) {
-               msg += `\n¡Se marcaron ${paidCount} cuota(s) como pagada(s)!`;
+                if (paidCount > 0) {
+                  msg += `\n¡Se marcaron ${paidCount} cuota(s) como pagada(s)!`;
+                }
+             } else {
+               console.log("No eligible installments found for this month or earlier");
              }
           }
+        } else {
+          console.log("No matching credit line found in creditLines state array:", creditLines);
         }
       }
       

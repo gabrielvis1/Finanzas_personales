@@ -36,17 +36,11 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => <FontAwesome name="pie-chart" size={24} color={color} />,
         }}
       />
-      <Tabs.Screen
-        name="goals"
-        options={{
-          title: 'Metas',
-          tabBarIcon: ({ color }) => <FontAwesome name="star" size={24} color={color} />,
-        }}
-      />
+
       <Tabs.Screen
         name="credits"
         options={{
-          title: 'Deudas',
+          title: 'Créditos',
           tabBarIcon: ({ color }) => <FontAwesome name="credit-card" size={24} color={color} />,
         }}
       />
