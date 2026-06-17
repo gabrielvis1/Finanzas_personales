@@ -1,4 +1,3 @@
-import { GoogleGenAI } from '@google/genai';
 import { AssetService } from './services/AssetService';
 import { BudgetService } from './services/BudgetService';
 import { CreditLineService } from './services/CreditLineService';
@@ -6,29 +5,43 @@ import { TransactionService } from './services/TransactionService';
 
 const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
 
-// Initialize the Gemini client
-export const ai = new GoogleGenAI({ apiKey });
-
-export async function analyzeReceipt(base64Data: string, mimeType: string = 'image/jpeg') {
+async function callGemini(payload: any): Promise<any> {
   if (!apiKey) {
     throw new Error('API Key de Gemini no configurada.');
   }
-  
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                data: base64Data,
-                mimeType: mimeType,
-              }
-            },
-            {
-              text: `Analiza esta factura, recibo o comprobante de pago. Extrae la siguiente información y devuélvela ÚNICAMENTE en formato JSON, sin texto adicional, sin formato markdown, sólo el objeto JSON puro.
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Error en API de Gemini: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data;
+}
+
+export async function analyzeReceipt(base64Data: string, mimeType: string = 'image/jpeg') {
+  const payload = {
+    contents: [
+      {
+        parts: [
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: base64Data,
+            }
+          },
+          {
+            text: `Analiza esta factura, recibo o comprobante de pago. Extrae la siguiente información y devuélvela ÚNICAMENTE en formato JSON, sin texto adicional, sin formato markdown, sólo el objeto JSON puro.
               El JSON debe tener esta estructura exacta:
               {
                 "amount": number (el monto total de la factura, usa punto para decimales. No incluyas el signo de moneda),
@@ -37,16 +50,16 @@ export async function analyzeReceipt(base64Data: string, mimeType: string = 'ima
                 "type": string (debe ser estrictamente "expense" o "income". Asume "expense" si es una factura de compra),
                 "is_valid": boolean (true si parece una factura o comprobante real, false si parece una imagen irrelevante)
               }`
-            }
-          ]
-        }
-      ]
-    });
-    
-    const text = response.text || '';
-    // Clean up potential markdown formatting that the AI might add despite instructions
+          }
+        ]
+      }
+    ]
+  };
+
+  try {
+    const response = await callGemini(payload);
+    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const cleanJson = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    
     return JSON.parse(cleanJson);
   } catch (error) {
     console.error('Error in analyzeReceipt:', error);
@@ -55,10 +68,7 @@ export async function analyzeReceipt(base64Data: string, mimeType: string = 'ima
 }
 
 export async function processVoiceAssistant(audioBase64: string, mimeType: string, textHistory: string = "") {
-  if (!apiKey) throw new Error('API Key de Gemini no configurada.');
-
-  try {
-    const prompt = `Eres el asistente financiero de Finiax. El usuario te está hablando para registrar un movimiento. 
+  const prompt = `Eres el asistente financiero de Finiax. El usuario te está hablando para registrar un movimiento. 
 Tu objetivo es extraer: amount (número), name (título corto), category (categoría), payment_method ('cash', 'credit_card', 'debit'), y type ('income', 'expense').
 Historial de la conversación (si existe): "${textHistory}".
 
@@ -70,20 +80,20 @@ Reglas:
 
 NO uses formato markdown (\`\`\`json) bajo ninguna circunstancia. Devuelve el JSON puro.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { data: audioBase64, mimeType } },
-            { text: prompt }
-          ]
-        }
-      ]
-    });
+  const payload = {
+    contents: [
+      {
+        parts: [
+          { inlineData: { data: audioBase64, mimeType } },
+          { text: prompt }
+        ]
+      }
+    ]
+  };
 
-    const text = response.text || '';
+  try {
+    const response = await callGemini(payload);
+    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const cleanJson = text.replace(/```json/g, '').replace(/```/g, '').trim();
     return JSON.parse(cleanJson);
   } catch (error) {
@@ -217,8 +227,6 @@ const toolDeclarations = [
 ];
 
 export async function chatWithAssistant(userId: string, messages: any[]) {
-  if (!apiKey) throw new Error('API Key de Gemini no configurada.');
-
   let currentMessages = [...messages];
   const systemInstruction = `Eres Finiax AI, el asistente financiero inteligente de Finiax.
 Puedes interactuar con los datos del usuario usando tus herramientas para obtener o registrar información (transacciones, activos, deudas, presupuestos).
@@ -230,26 +238,32 @@ Si el usuario pregunta por resúmenes o distribución de gastos o activos, obté
     let loopCount = 0;
     while (loopCount < 5) {
       loopCount++;
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+      const payload = {
         contents: currentMessages,
-        config: {
-          systemInstruction,
-          tools: [{ functionDeclarations: toolDeclarations as any }]
-        }
-      });
+        systemInstruction: {
+          parts: [{ text: systemInstruction }]
+        },
+        tools: [{ functionDeclarations: toolDeclarations as any }]
+      };
 
-      // Si hay llamadas a funciones solicitadas
-      if (response.functionCalls && response.functionCalls.length > 0) {
+      const response = await callGemini(payload);
+      const candidate = response.candidates?.[0];
+      const modelContent = candidate?.content;
+      const parts = modelContent?.parts || [];
+
+      // Check if there are functionCalls
+      const functionCalls = parts.filter((p: any) => p.functionCall).map((p: any) => p.functionCall);
+
+      if (functionCalls.length > 0) {
         // Guardar la llamada a función de la IA en la historia
         currentMessages.push({
           role: 'model',
-          parts: response.functionCalls.map(call => ({ functionCall: call }))
+          parts: functionCalls.map((call: any) => ({ functionCall: call }))
         });
 
         const functionResponses: any[] = [];
 
-        for (const call of response.functionCalls) {
+        for (const call of functionCalls) {
           const { name, args } = call;
           let result: any = { success: false };
 
@@ -314,8 +328,9 @@ Si el usuario pregunta por resúmenes o distribución de gastos o activos, obté
         });
       } else {
         // No hay llamadas a funciones, Gemini devolvió una respuesta textual
+        const text = parts.find((p: any) => p.text)?.text || '';
         return {
-          text: response.text || '',
+          text,
           history: currentMessages
         };
       }
@@ -335,8 +350,6 @@ export async function getInvestmentAdvice(
   salary: number,
   investPercent: number
 ): Promise<string> {
-  if (!apiKey) throw new Error('API Key de Gemini no configurada.');
-
   const prompt = `Eres un asesor financiero experto y estratega de portafolio para Finiax.
 Analiza la siguiente información de inversión del usuario y brinda una recomendación premium, amigable y muy estructurada en español:
 
@@ -354,12 +367,14 @@ Tu tarea:
 - Brinda sugerencias específicas de Cedears para comprar este mes en base a empresas sólidas que pagan dividendos estables (menciona cuáles pagan dividendos próximamente).
 - Sé conciso pero sumamente profesional.`;
 
+  const payload = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }]
+  };
+
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }]
-    });
-    return response.text || 'No se pudo generar recomendación en este momento.';
+    const response = await callGemini(payload);
+    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return text || 'No se pudo generar recomendación en este momento.';
   } catch (e: any) {
     console.error('Error in getInvestmentAdvice:', e);
     return 'Error al obtener asesoramiento de IA: ' + e.message;
