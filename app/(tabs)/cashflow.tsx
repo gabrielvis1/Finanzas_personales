@@ -46,19 +46,59 @@ export default function CashFlowScreen() {
   const [transactionsHistory, setTransactionsHistory] = useState<any[]>([]);
   const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null);
 
+  // Filtros de Historial
+  const [searchText, setSearchText] = useState('');
+  const [filterType, setFilterType] = useState<'all' | 'income' | 'expense' | 'debt'>('all');
+  const [filterCategory, setFilterCategory] = useState('all');
+  const [filterTime, setFilterTime] = useState<'all' | 'this_month' | 'last_month' | 'last_30_days'>('all');
+
   const fetchHistory = useCallback(async () => {
     if (!session?.user?.id) return;
     const { data } = await supabase.from('transactions')
       .select('*')
       .eq('user_id', session.user.id)
       .order('date', { ascending: false })
-      .limit(30);
+      .limit(200); // Límite amplio para filtrado offline
     if (data) setTransactionsHistory(data);
   }, [session]);
 
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
+
+  const getFilteredTransactions = () => {
+    return transactionsHistory.filter(t => {
+      const matchesText = searchText.trim() === '' || 
+        t.name.toLowerCase().includes(searchText.toLowerCase()) ||
+        (t.description && t.description.toLowerCase().includes(searchText.toLowerCase())) ||
+        t.category.toLowerCase().includes(searchText.toLowerCase());
+
+      let matchesType = true;
+      if (filterType === 'income') matchesType = t.type === 'income';
+      else if (filterType === 'expense') matchesType = t.type === 'expense' && t.payment_method !== 'credit_card';
+      else if (filterType === 'debt') matchesType = t.payment_method === 'credit_card' || t.category === 'CRÉDITOS';
+
+      const matchesCategory = filterCategory === 'all' || t.category === filterCategory;
+
+      let matchesTime = true;
+      const tDate = new Date(t.date);
+      const now = new Date();
+      if (filterTime === 'this_month') {
+        matchesTime = tDate.getMonth() === now.getMonth() && tDate.getFullYear() === now.getFullYear();
+      } else if (filterTime === 'last_month') {
+        let lastM = now.getMonth() - 1;
+        let lastY = now.getFullYear();
+        if (lastM < 0) { lastM = 11; lastY--; }
+        matchesTime = tDate.getMonth() === lastM && tDate.getFullYear() === lastY;
+      } else if (filterTime === 'last_30_days') {
+        const diffTime = Math.abs(now.getTime() - tDate.getTime());
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        matchesTime = diffDays <= 30;
+      }
+
+      return matchesText && matchesType && matchesCategory && matchesTime;
+    });
+  };
 
   // Voice State
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -607,11 +647,109 @@ export default function CashFlowScreen() {
       {successMsg ? <Text style={[styles.successText, {marginTop: 16}]}>{successMsg}</Text> : null}
 
       <View style={{marginTop: 32}}>
-        <Text style={[styles.title, {fontSize: 20}]}>Historial de Movimientos</Text>
-        {transactionsHistory.length === 0 ? (
-          <Text style={{color: '#888', fontStyle: 'italic'}}>No hay movimientos recientes.</Text>
+        <Text style={[styles.title, {fontSize: 20, marginBottom: 16}]}>Historial de Movimientos</Text>
+        
+        {/* Barra de Búsqueda */}
+        <View style={styles.searchBarContainer}>
+          <FontAwesome name="search" size={14} color="#888" style={{ marginRight: 10 }} />
+          <TextInput
+            style={styles.searchBarInput}
+            placeholder="Buscar por título, categoría o desc..."
+            placeholderTextColor="#666"
+            value={searchText}
+            onChangeText={setSearchText}
+          />
+          {searchText !== '' && (
+            <TouchableOpacity onPress={() => setSearchText('')}>
+              <FontAwesome name="times-circle" size={16} color="#888" />
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* Filtro de Tipo (Todos / Ingresos / Gastos / Deudas) */}
+        <Text style={styles.filterSectionLabel}>Filtrar por tipo</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterPillsRow}>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterType === 'all' && styles.filterPillActive]} 
+            onPress={() => setFilterType('all')}
+          >
+            <Text style={[styles.filterPillText, filterType === 'all' && styles.filterPillTextActive]}>Todos</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterType === 'income' && styles.filterPillActive]} 
+            onPress={() => setFilterType('income')}
+          >
+            <Text style={[styles.filterPillText, filterType === 'income' && styles.filterPillTextActive]}>Ingresos</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterType === 'expense' && styles.filterPillActive]} 
+            onPress={() => setFilterType('expense')}
+          >
+            <Text style={[styles.filterPillText, filterType === 'expense' && styles.filterPillTextActive]}>Gastos</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterType === 'debt' && styles.filterPillActive]} 
+            onPress={() => setFilterType('debt')}
+          >
+            <Text style={[styles.filterPillText, filterType === 'debt' && styles.filterPillTextActive]}>Deudas/Crédito</Text>
+          </TouchableOpacity>
+        </ScrollView>
+
+        {/* Filtro de Fecha */}
+        <Text style={styles.filterSectionLabel}>Filtrar por fecha</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterPillsRow}>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterTime === 'all' && styles.filterPillActive]} 
+            onPress={() => setFilterTime('all')}
+          >
+            <Text style={[styles.filterPillText, filterTime === 'all' && styles.filterPillTextActive]}>Cualquier fecha</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterTime === 'this_month' && styles.filterPillActive]} 
+            onPress={() => setFilterTime('this_month')}
+          >
+            <Text style={[styles.filterPillText, filterTime === 'this_month' && styles.filterPillTextActive]}>Este mes</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterTime === 'last_month' && styles.filterPillActive]} 
+            onPress={() => setFilterTime('last_month')}
+          >
+            <Text style={[styles.filterPillText, filterTime === 'last_month' && styles.filterPillTextActive]}>Mes anterior</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterTime === 'last_30_days' && styles.filterPillActive]} 
+            onPress={() => setFilterTime('last_30_days')}
+          >
+            <Text style={[styles.filterPillText, filterTime === 'last_30_days' && styles.filterPillTextActive]}>Últimos 30 días</Text>
+          </TouchableOpacity>
+        </ScrollView>
+
+        {/* Filtro de Categoría */}
+        <Text style={styles.filterSectionLabel}>Filtrar por categoría</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterPillsRow}>
+          <TouchableOpacity 
+            style={[styles.filterPill, filterCategory === 'all' && styles.filterPillActive]} 
+            onPress={() => setFilterCategory('all')}
+          >
+            <Text style={[styles.filterPillText, filterCategory === 'all' && styles.filterPillTextActive]}>Todas</Text>
+          </TouchableOpacity>
+          {Array.from(new Set(transactionsHistory.map(t => t.category))).map(cat => (
+            <TouchableOpacity 
+              key={cat}
+              style={[styles.filterPill, filterCategory === cat && styles.filterPillActive]} 
+              onPress={() => setFilterCategory(cat)}
+            >
+              <Text style={[styles.filterPillText, filterCategory === cat && styles.filterPillTextActive]}>{cat}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        <View style={{ height: 16 }} />
+
+        {getFilteredTransactions().length === 0 ? (
+          <Text style={{color: '#888', fontStyle: 'italic', marginTop: 12}}>No se encontraron movimientos con los filtros seleccionados.</Text>
         ) : (
-          transactionsHistory.map(t => {
+          getFilteredTransactions().map(t => {
             const colors = t.type === 'income' 
               ? { bg: '#0A2A1A', border: '#00D09E' }
               : t.payment_method === 'credit_card'
@@ -749,5 +887,59 @@ const styles = StyleSheet.create({
   historyCard: { padding: 16, borderRadius: 12, marginBottom: 12, borderLeftWidth: 4, flexDirection: 'row', alignItems: 'center' },
   historyName: { color: '#FFF', fontSize: 16, fontWeight: 'bold', marginBottom: 4 },
   historyDetail: { color: '#AAA', fontSize: 12 },
-  historyAmount: { fontSize: 16, fontWeight: 'bold' }
+  historyAmount: { fontSize: 16, fontWeight: 'bold' },
+
+  // Estilos de los Filtros de Historial
+  searchBarContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#161616',
+    borderWidth: 1,
+    borderColor: '#262626',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    height: 52,
+    marginBottom: 16
+  },
+  searchBarInput: {
+    flex: 1,
+    color: '#FFF',
+    fontSize: 14
+  },
+  filterSectionLabel: {
+    color: '#666',
+    fontSize: 10,
+    fontWeight: 'bold',
+    textTransform: 'uppercase',
+    marginBottom: 8,
+    marginTop: 8
+  },
+  filterPillsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingBottom: 8
+  },
+  filterPill: {
+    backgroundColor: '#161616',
+    borderWidth: 1,
+    borderColor: '#262626',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  filterPillActive: {
+    backgroundColor: '#00D09E',
+    borderColor: '#00D09E'
+  },
+  filterPillText: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '600'
+  },
+  filterPillTextActive: {
+    color: '#121212',
+    fontWeight: 'bold'
+  }
 });

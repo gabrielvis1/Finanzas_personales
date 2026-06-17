@@ -1,30 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useFocusEffect } from 'expo-router';
-import { StyleSheet, View, Text, TouchableOpacity, TextInput, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Modal, ScrollView } from 'react-native';
-import { supabase } from '@/lib/supabase';
+import { StyleSheet, View, Text, TouchableOpacity, TextInput, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Modal, ScrollView, Image } from 'react-native';
 import { useAuth } from '@/providers/AuthProvider';
 import { formatCurrency, formatNumber } from '@/lib/utils';
 import { FontAwesome } from '@expo/vector-icons';
 import DragList from 'react-native-draglist';
-
-type Budget = {
-  id: string;
-  category: string;
-  section: string;
-  limit_amount: number;
-  percentage: number | null;
-  spent_amount: number;
-  due_day: number | null;
-  month: number;
-  year: number;
-  row_color: string | null;
-  icon: string | null;
-  order_index: number;
-  is_debt?: boolean;
-  debt_status?: string;
-  credit_limit?: number;
-  credit_used?: number;
-};
+import { BudgetService, Budget, SharedBudget, SharedBudgetMember } from '@/lib/services/BudgetService';
+import { supabase } from '@/lib/supabase';
 
 const MONTHS = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 
@@ -66,6 +48,7 @@ export default function BudgetsScreen() {
   const [budgets, setBudgets] = useState<Budget[]>([]);
   const [totalIncome, setTotalIncome] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [expandedCreditLines, setExpandedCreditLines] = useState<Record<string, boolean>>({});
 
   const [addingSection, setAddingSection] = useState<string | null>(null);
   const [newCat, setNewCat] = useState('');
@@ -82,12 +65,23 @@ export default function BudgetsScreen() {
   
   const [isDragging, setIsDragging] = useState(false);
 
+  // Estados de Presupuestos Compartidos
+  const [sharedBudgets, setSharedBudgets] = useState<SharedBudget[]>([]);
+  const [activeSharedBudget, setActiveSharedBudget] = useState<SharedBudget | null>(null);
+  
+  // Modals de Compartidos
+  const [showCreateSharedModal, setShowCreateSharedModal] = useState(false);
+  const [newSharedName, setNewSharedName] = useState('');
+  const [showMembersModal, setShowMembersModal] = useState(false);
+  const [members, setMembers] = useState<SharedBudgetMember[]>([]);
+  const [newMemberUsername, setNewMemberUsername] = useState('');
+
   useFocusEffect(
     useCallback(() => {
       if (session?.user?.id) {
         loadMonthData();
       }
-    }, [session, currentMonth, currentYear])
+    }, [session, currentMonth, currentYear, activeSharedBudget])
   );
 
   const loadMonthData = async () => {
@@ -96,120 +90,49 @@ export default function BudgetsScreen() {
       const startOfMonth = new Date(currentYear, currentMonth, 1).toISOString();
       const endOfMonth = new Date(currentYear, currentMonth + 1, 0, 23, 59, 59).toISOString();
 
-      const { data: budgetData, error: budgetError } = await supabase
-        .from('budgets')
-        .select('*')
-        .eq('user_id', session!.user.id)
-        .eq('month', currentMonth + 1)
-        .eq('year', currentYear)
-        .order('order_index', { ascending: true });
+      // Cargar lista de presupuestos compartidos
+      const sList = await BudgetService.getSharedBudgets(session!.user.id);
+      setSharedBudgets(sList);
 
-      if (budgetError) throw budgetError;
-
-      const { data: txData, error: txError } = await supabase
+      // Consultar ingresos del mes activo para el presupuesto seleccionado
+      let txQuery = supabase
         .from('transactions')
         .select('type, category, amount')
-        .eq('user_id', session!.user.id)
         .gte('date', startOfMonth)
         .lte('date', endOfMonth);
+        
+      if (activeSharedBudget) {
+        txQuery = txQuery.eq('shared_budget_id', activeSharedBudget.id);
+      } else {
+        txQuery = txQuery.eq('user_id', session!.user.id).is('shared_budget_id', null);
+      }
+
+      const { data: txData, error: txError } = await txQuery;
 
       if (txError) throw txError;
 
       let income = 0;
-      const spentByCategory: Record<string, number> = {};
-
       txData?.forEach((tx) => {
         if (tx.type === 'income') {
           income += Number(tx.amount);
-        } else if (tx.type === 'expense') {
-          const cat = tx.category.toLowerCase().trim();
-          spentByCategory[cat] = (spentByCategory[cat] || 0) + Number(tx.amount);
-
-          // Si es un pago de deuda/crédito, acumular bajo nombres comunes de presupuesto de deudas/créditos
-          if (cat.startsWith('pago: ') || cat === 'pago de deuda' || cat === 'deudas / créditos' || cat === 'deudas / creditos' || cat === 'créditos' || cat === 'creditos') {
-            const commonDebtCats = ['pago de deuda', 'pago de deudas', 'deudas', 'deuda', 'créditos', 'creditos', 'pago de deuda', 'pago de deudas', 'deudas / créditos', 'deudas / creditos', 'créditos', 'creditos'];
-            commonDebtCats.forEach(c => {
-              spentByCategory[c] = (spentByCategory[c] || 0) + Number(tx.amount);
-            });
-          }
         }
       });
-
       setTotalIncome(income);
 
-      // Fix para reparar items que tengan order_index = 0
-      let fixIndex = 10; 
+      const list = await BudgetService.getBudgets(
+        session!.user.id, 
+        currentMonth, 
+        currentYear, 
+        income,
+        activeSharedBudget?.id
+      );
+      setBudgets(list);
       
-      const mapped = budgetData?.map(b => {
-        let calcLimit = Number(b.limit_amount);
-        if (b.percentage) {
-          calcLimit = (Number(b.percentage) / 100) * income;
-        }
-
-        return {
-          id: b.id,
-          category: b.category,
-          section: b.section || 'General',
-          limit_amount: calcLimit,
-          percentage: b.percentage ? Number(b.percentage) : null,
-          due_day: b.due_day,
-          month: b.month,
-          year: b.year,
-          row_color: b.row_color,
-          icon: b.icon,
-          order_index: b.order_index === 0 ? (fixIndex++) : b.order_index,
-          spent_amount: spentByCategory[b.category.toLowerCase().trim()] || 0
-        };
-      }) || [];
-
-      const { data: debtData, error: debtError } = await supabase
-        .from('debt_installments')
-        .select('*, credit_lines(name, limit_amount)')
-        .eq('user_id', session!.user.id)
-        .eq('month', currentMonth + 1)
-        .eq('year', currentYear);
-
-      if (debtError) throw debtError;
-
-      const { data: allPendingDebt } = await supabase
-        .from('debt_installments')
-        .select('credit_line_id, amount')
-        .eq('user_id', session!.user.id)
-        .eq('status', 'pending');
-
-      const usedByCreditLine: Record<string, number> = {};
-      allPendingDebt?.forEach(d => {
-        if (d.credit_line_id) {
-          usedByCreditLine[d.credit_line_id] = (usedByCreditLine[d.credit_line_id] || 0) + Number(d.amount);
-        }
-      });
-
-      const debtMapped = debtData?.map((d: any) => {
-        const clId = d.credit_line_id;
-        const limit = d.credit_lines ? Number(d.credit_lines.limit_amount || 0) : 0;
-        const used = clId ? (usedByCreditLine[clId] || 0) : 0;
-
-        return {
-          id: `debt_${d.id}`,
-          category: `${d.credit_lines?.name || 'Crédito'}: ${d.description} (${d.installment_number}/${d.total_installments})`,
-          section: 'CRÉDITOS',
-          limit_amount: Number(d.amount),
-          percentage: null,
-          due_day: null,
-          month: d.month,
-          year: d.year,
-          row_color: d.row_color || '#78350F',
-          icon: d.icon || 'credit-card',
-          order_index: 999, 
-          spent_amount: d.status === 'paid' ? Number(d.amount) : 0,
-          is_debt: true,
-          debt_status: d.status,
-          credit_limit: limit,
-          credit_used: used
-        };
-      }) || [];
-
-      setBudgets([...mapped, ...debtMapped]);
+      // Si hay un presupuesto compartido activo, cargar sus miembros
+      if (activeSharedBudget) {
+        const mList = await BudgetService.getSharedBudgetMembers(activeSharedBudget.id);
+        setMembers(mList);
+      }
     } catch (error: any) {
       Alert.alert('Error', error.message);
     } finally {
@@ -227,43 +150,11 @@ export default function BudgetsScreen() {
   };
 
   const handleClonePreviousMonth = async () => {
-    let prevM = currentMonth - 1;
-    let prevY = currentYear;
-    if (prevM < 0) { prevM = 11; prevY--; }
-
-    const { data, error } = await supabase
-      .from('budgets')
-      .select('category, section, limit_amount, percentage, due_day, row_color, icon, order_index')
-      .eq('user_id', session!.user.id)
-      .eq('month', prevM + 1)
-      .eq('year', prevY);
-
-    if (error || !data || data.length === 0) {
-      Alert.alert('Aviso', 'No hay datos en el mes anterior para clonar.');
-      return;
-    }
-
-    const newBudgets = data.map(b => ({
-      user_id: session!.user.id,
-      category: b.category,
-      section: b.section,
-      limit_amount: b.limit_amount,
-      percentage: b.percentage,
-      due_day: b.due_day,
-      row_color: b.row_color,
-      icon: b.icon,
-      order_index: b.order_index,
-      month: currentMonth + 1,
-      year: currentYear,
-      start_date: new Date(currentYear, currentMonth, 1).toISOString(),
-      end_date: new Date(currentYear, currentMonth + 1, 0).toISOString()
-    }));
-
-    const { error: insertError } = await supabase.from('budgets').insert(newBudgets);
-    if (insertError) {
-      Alert.alert('Error clonando', insertError.message);
-    } else {
+    try {
+      await BudgetService.clonePreviousMonth(session!.user.id, currentMonth, currentYear, activeSharedBudget?.id);
       loadMonthData();
+    } catch (error: any) {
+      Alert.alert('Error', error.message);
     }
   };
 
@@ -275,29 +166,29 @@ export default function BudgetsScreen() {
 
     const maxOrder = budgets.reduce((max, b) => Math.max(max, b.order_index), 0);
 
-    const { error } = await supabase.from('budgets').insert({
-      user_id: session!.user.id,
-      category: newCat,
-      section: section,
-      limit_amount: newIsPercent ? 0 : Number(newLimit),
-      percentage: newIsPercent ? Number(newLimit) : null,
-      due_day: newDue ? Number(newDue) : null,
-      order_index: maxOrder + 1, 
-      month: currentMonth + 1,
-      year: currentYear,
-      start_date: new Date(currentYear, currentMonth, 1).toISOString(),
-      end_date: new Date(currentYear, currentMonth + 1, 0).toISOString()
-    });
+    try {
+      await BudgetService.saveBudget(session!.user.id, {
+        category: newCat,
+        section: section,
+        limit_amount: newIsPercent ? 0 : Number(newLimit),
+        percentage: newIsPercent ? Number(newLimit) : null,
+        due_day: newDue ? Number(newDue) : null,
+        order_index: maxOrder + 1,
+        month: currentMonth + 1,
+        year: currentYear,
+        row_color: null,
+        icon: null,
+        shared_budget_id: activeSharedBudget?.id || null
+      });
 
-    if (error) {
-      Alert.alert('Error', error.message);
-    } else {
       setAddingSection(null);
       setNewCat('');
       setNewLimit('');
       setNewDue('');
       setNewIsPercent(false);
       loadMonthData();
+    } catch (error: any) {
+      Alert.alert('Error', error.message);
     }
   };
 
@@ -313,19 +204,24 @@ export default function BudgetsScreen() {
   const saveFullEdit = async () => {
     if (!editingItem || isNaN(Number(editLimitVal))) return;
     
-    const updatePayload = {
-      category: editName,
-      limit_amount: editIsPercent ? 0 : Number(editLimitVal),
-      percentage: editIsPercent ? Number(editLimitVal) : null,
-      row_color: editColor,
-      icon: editIcon
-    };
+    try {
+      await BudgetService.saveBudget(session!.user.id, {
+        id: editingItem.id,
+        category: editName,
+        section: editingItem.section,
+        limit_amount: editIsPercent ? 0 : Number(editLimitVal),
+        percentage: editIsPercent ? Number(editLimitVal) : null,
+        due_day: editingItem.due_day,
+        order_index: editingItem.order_index,
+        month: editingItem.month,
+        year: editingItem.year,
+        row_color: editColor,
+        icon: editIcon
+      });
 
-    const { error } = await supabase.from('budgets').update(updatePayload).eq('id', editingItem.id);
-    if (!error) {
       setEditingItem(null);
       loadMonthData();
-    } else {
+    } catch (error: any) {
       Alert.alert('Error', error.message);
     }
   };
@@ -336,9 +232,13 @@ export default function BudgetsScreen() {
     if (Platform.OS === 'web') {
       const confirmed = window.confirm('¿Estás seguro de borrar este concepto?');
       if (confirmed) {
-        await supabase.from('budgets').delete().eq('id', editingItem.id);
-        setEditingItem(null);
-        loadMonthData();
+        try {
+          await BudgetService.deleteBudget(editingItem.id);
+          setEditingItem(null);
+          loadMonthData();
+        } catch (error: any) {
+          Alert.alert('Error', error.message);
+        }
       }
       return;
     }
@@ -346,9 +246,13 @@ export default function BudgetsScreen() {
     Alert.alert('Eliminar', '¿Estás seguro de borrar este concepto?', [
       { text: 'Cancelar', style: 'cancel' },
       { text: 'Eliminar', style: 'destructive', onPress: async () => {
-          await supabase.from('budgets').delete().eq('id', editingItem.id);
-          setEditingItem(null);
-          loadMonthData();
+          try {
+            await BudgetService.deleteBudget(editingItem.id);
+            setEditingItem(null);
+            loadMonthData();
+          } catch (error: any) {
+            Alert.alert('Error', error.message);
+          }
         }
       }
     ]);
@@ -357,26 +261,87 @@ export default function BudgetsScreen() {
   const markDebtPaid = async (b: Budget) => {
     if (b.debt_status === 'paid') return;
     
-    Alert.alert('Pagar Cuota', `¿Deseas registrar el pago de ${b.category} por $${formatCurrency(b.limit_amount)}?`, [
+    Alert.alert('Pagar Cuota', `¿Deseas registrar el pago de todas las cuotas de ${b.category} por un total de $${formatCurrency(b.limit_amount)}?`, [
       { text: 'Cancelar', style: 'cancel' },
       { text: 'Registrar Pago', onPress: async () => {
-          const actualId = b.id.replace('debt_', '');
-          
-          await supabase.from('debt_installments').update({ status: 'paid' }).eq('id', actualId);
-          
-          await supabase.from('transactions').insert({
-            user_id: session!.user.id,
-            name: b.category,
-            amount: b.limit_amount,
-            type: 'expense',
-            category: 'CRÉDITOS',
-            payment_method: 'debit',
-            date: new Date().toISOString()
-          });
-
-          loadMonthData();
+          try {
+            if (b.installments && b.installments.length > 0) {
+              for (const inst of b.installments) {
+                if (inst.status !== 'paid') {
+                  await BudgetService.markInstallmentPaid(session!.user.id, inst.id, `${b.category}: ${inst.description} (${inst.installment_number}/${inst.total_installments})`, inst.amount);
+                }
+              }
+            } else {
+              await BudgetService.markDebtPaid(session!.user.id, b);
+            }
+            loadMonthData();
+          } catch (error: any) {
+            Alert.alert('Error', error.message);
+          }
       }}
     ]);
+  };
+
+  const markSingleInstallmentPaid = async (instId: string, desc: string, amount: number) => {
+    Alert.alert('Pagar Cuota', `¿Deseas registrar el pago de ${desc} por $${formatCurrency(amount)}?`, [
+      { text: 'Cancelar', style: 'cancel' },
+      { text: 'Registrar Pago', onPress: async () => {
+          try {
+            await BudgetService.markInstallmentPaid(session!.user.id, instId, desc, amount);
+            loadMonthData();
+          } catch (error: any) {
+            Alert.alert('Error', error.message);
+          }
+      }}
+    ]);
+  };
+
+  const toggleCreditLineExpand = (id: string) => {
+    setExpandedCreditLines(prev => ({
+      ...prev,
+      [id]: !prev[id]
+    }));
+  };
+
+  const handleCreateSharedBudget = async () => {
+    if (!newSharedName.trim()) return;
+    try {
+      const group = await BudgetService.createSharedBudget(session!.user.id, newSharedName.trim());
+      setNewSharedName('');
+      setShowCreateSharedModal(false);
+      setActiveSharedBudget(group);
+    } catch (e: any) {
+      Alert.alert('Error', 'No se pudo crear el presupuesto compartido: ' + e.message);
+    }
+  };
+
+  const handleAddMember = async () => {
+    if (!activeSharedBudget || !newMemberUsername.trim()) return;
+    try {
+      await BudgetService.addMemberToSharedBudget(activeSharedBudget.id, newMemberUsername.trim());
+      setNewMemberUsername('');
+      const mList = await BudgetService.getSharedBudgetMembers(activeSharedBudget.id);
+      setMembers(mList);
+      Alert.alert('Éxito', 'Miembro agregado exitosamente.');
+    } catch (e: any) {
+      Alert.alert('Error', e.message);
+    }
+  };
+
+  const handleRemoveMember = async (userId: string) => {
+    if (!activeSharedBudget) return;
+    try {
+      await BudgetService.removeMemberFromSharedBudget(activeSharedBudget.id, userId);
+      const mList = await BudgetService.getSharedBudgetMembers(activeSharedBudget.id);
+      setMembers(mList);
+      
+      if (userId === session!.user.id) {
+        setActiveSharedBudget(null);
+        setShowMembersModal(false);
+      }
+    } catch (e: any) {
+      Alert.alert('Error', 'No se pudo remover al miembro.');
+    }
   };
 
   const handleReorder = async (sectionBudgets: Budget[], fromIndex: number, toIndex: number, sectionName: string) => {
@@ -384,24 +349,24 @@ export default function BudgetsScreen() {
     const [removed] = copy.splice(fromIndex, 1);
     copy.splice(toIndex, 0, removed);
 
-    // Reasignar indices localmente
     const newlyOrdered = copy.map((b, idx) => ({ ...b, order_index: idx + 1 }));
 
-    // Actualizar estado general
     setBudgets(prev => {
       const others = prev.filter(b => b.section !== sectionName);
       return [...others, ...newlyOrdered];
     });
 
-    // Guardar en DB en segundo plano
     newlyOrdered.forEach(async (b) => {
-      await supabase.from('budgets').update({ order_index: b.order_index }).eq('id', b.id);
+      await BudgetService.updateOrderIndex(b.id, b.order_index);
     });
   };
 
   const sectionsSet = new Set(budgets.map(b => b.section));
   sectionsSet.add('Gastos Fijos');
   sectionsSet.add('Gastos Variables');
+  if (activeSharedBudget) {
+    sectionsSet.delete('CRÉDITOS');
+  }
   const sections = Array.from(sectionsSet);
 
   const totalBudget = budgets.reduce((acc, b) => acc + b.limit_amount, 0);
@@ -409,7 +374,6 @@ export default function BudgetsScreen() {
   const remainingIncome = totalIncome - totalSpent; 
   const toPayAmount = Math.max(0, totalBudget - totalSpent);
   
-  // Dinero real que falta para cubrir lo que falta pagar: (Falta pagar - Lo que nos queda de ingresos)
   const realMissingCash = Math.max(0, toPayAmount - remainingIncome);
   const budgetPaidProgress = totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
 
@@ -421,6 +385,50 @@ export default function BudgetsScreen() {
     <KeyboardAvoidingView style={{flex: 1}} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView style={styles.container} scrollEnabled={!isDragging}>
         
+        {/* Selector de Presupuesto (Personal / Compartidos) */}
+        <View style={styles.workspaceHeader}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.workspaceTabs}>
+            <TouchableOpacity 
+              style={[styles.workspaceTab, !activeSharedBudget && styles.workspaceTabActive]}
+              onPress={() => setActiveSharedBudget(null)}
+            >
+              <FontAwesome name="user" size={12} color={!activeSharedBudget ? '#121212' : '#888'} style={{ marginRight: 6 }} />
+              <Text style={[styles.workspaceTabText, !activeSharedBudget && styles.workspaceTabTextActive]}>Personal</Text>
+            </TouchableOpacity>
+
+            {sharedBudgets.map(sb => {
+              const isActive = activeSharedBudget?.id === sb.id;
+              return (
+                <TouchableOpacity 
+                  key={sb.id} 
+                  style={[styles.workspaceTab, isActive && styles.workspaceTabActive]}
+                  onPress={() => setActiveSharedBudget(sb)}
+                >
+                  <FontAwesome name="users" size={12} color={isActive ? '#121212' : '#888'} style={{ marginRight: 6 }} />
+                  <Text style={[styles.workspaceTabText, isActive && styles.workspaceTabTextActive]}>{sb.name}</Text>
+                </TouchableOpacity>
+              );
+            })}
+
+            <TouchableOpacity 
+              style={styles.addWorkspaceTab}
+              onPress={() => setShowCreateSharedModal(true)}
+            >
+              <FontAwesome name="plus" size={12} color="#00D09E" />
+            </TouchableOpacity>
+          </ScrollView>
+
+          {activeSharedBudget && (
+            <TouchableOpacity 
+              style={styles.manageMembersBtn}
+              onPress={() => setShowMembersModal(true)}
+            >
+              <FontAwesome name="cog" size={14} color="#00D09E" style={{ marginRight: 6 }} />
+              <Text style={styles.manageMembersBtnText}>Compartir</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
         <View style={styles.dateSelector}>
           <TouchableOpacity onPress={() => changeMonth(-1)}><FontAwesome name="chevron-left" size={20} color="#FFF" /></TouchableOpacity>
           <Text style={styles.dateText}>{MONTHS[currentMonth]} {currentYear}</Text>
@@ -464,7 +472,7 @@ export default function BudgetsScreen() {
           </View>
         </View>
 
-        {budgets.length === 0 && (
+        {budgets.filter(b => b.section === 'Gastos Fijos' || b.section === 'Gastos Variables').length === 0 && (
           <TouchableOpacity style={styles.cloneBtn} onPress={handleClonePreviousMonth}>
             <FontAwesome name="copy" size={16} color="#000" style={{marginRight: 8}} />
             <Text style={styles.cloneBtnText}>Clonar del mes anterior</Text>
@@ -520,70 +528,124 @@ export default function BudgetsScreen() {
                   const usedVal = b.credit_used || 0;
                   const creditPct = limitVal > 0 ? Math.min(100, Math.round((usedVal / limitVal) * 100)) : 0;
 
+                  const isExpanded = b.is_debt && !!expandedCreditLines[b.id];
+
                   return (
-                    <View
-                      style={[styles.row, { backgroundColor: rowBgColor, opacity: isActive ? 0.7 : 1, transform: [{scale: isActive ? 1.02 : 1}], zIndex: isActive ? 99 : 1, elevation: isActive ? 5 : 0 }]}
-                    >
-                      <View style={[styles.colorIndicator, { backgroundColor: indicatorColor }]} />
-                      <View style={[styles.rowContent, { flexDirection: 'column', alignItems: 'stretch' }]}>
-                        <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                          <View style={{flex: 2, flexDirection: 'row', alignItems: 'center'}}>
-                            <FontAwesome name={(b.icon as any) || 'circle-o'} size={14} color="#00D09E" style={{marginRight: 8}} />
-                            <Text style={[styles.td, {fontWeight: 'bold', flex: 1}]} numberOfLines={1}>{b.category}</Text>
-                          </View>
-                          
-                          <Text style={[styles.td, {flex: 1.5, textAlign: 'right'}]}>${formatCurrency(b.spent_amount)}</Text>
-                          <Text style={[styles.td, {flex: 1.5, textAlign: 'right', fontSize: 11}]}>
-                              ${formatCurrency(b.limit_amount)}
-                          </Text>
-                          <Text style={[styles.td, {width: 40, textAlign: 'right', fontSize: 10}]}>{pct}%</Text>
-                          
-                          <View style={{width: 60, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center'}}>
-                            {b.is_debt ? (
-                              b.debt_status === 'paid' ? (
-                                <FontAwesome name="check-circle" size={20} color="#00D09E" style={{marginRight: 8}} />
+                    <View style={{ flexDirection: 'column' }}>
+                      <TouchableOpacity
+                        activeOpacity={b.is_debt ? 0.8 : 1}
+                        onPress={() => {
+                          if (b.is_debt) {
+                            toggleCreditLineExpand(b.id);
+                          }
+                        }}
+                        style={[styles.row, { backgroundColor: rowBgColor, opacity: isActive ? 0.7 : 1, transform: [{scale: isActive ? 1.02 : 1}], zIndex: isActive ? 99 : 1, elevation: isActive ? 5 : 0 }]}
+                      >
+                        <View style={[styles.colorIndicator, { backgroundColor: indicatorColor }]} />
+                        <View style={[styles.rowContent, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                          <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                            <View style={{flex: 2, flexDirection: 'row', alignItems: 'center'}}>
+                              {b.is_debt ? (
+                                <FontAwesome name={isExpanded ? 'chevron-down' : 'chevron-right'} size={12} color="#00D09E" style={{marginRight: 8, width: 14}} />
                               ) : (
-                                <TouchableOpacity onPress={() => markDebtPaid(b)} style={{padding: 6}}>
-                                  <FontAwesome name="money" size={16} color="#FFD700" />
-                                </TouchableOpacity>
-                              )
-                            ) : (
-                              <>
-                                <TouchableOpacity 
-                                  activeOpacity={0.5}
-                                  onPressIn={() => { setIsDragging(true); onDragStart(); }}
-                                  onPressOut={() => { setIsDragging(false); onDragEnd(); }}
-                                  style={{padding: 10}}
-                                >
-                                  <FontAwesome name="bars" size={16} color={isActive ? '#00D09E' : '#888'} />
-                                </TouchableOpacity>
-                                <TouchableOpacity onPress={() => openEditModal(b)} style={{padding: 6}}>
-                                  <FontAwesome name="cog" size={14} color="#AAA" />
-                                </TouchableOpacity>
-                              </>
-                            )}
+                                <FontAwesome name={(b.icon as any) || 'circle-o'} size={14} color="#00D09E" style={{marginRight: 8}} />
+                              )}
+                              <Text style={[styles.td, {fontWeight: 'bold', flex: 1}]} numberOfLines={1}>{b.category}</Text>
+                            </View>
+                            
+                            <Text style={[styles.td, {flex: 1.5, textAlign: 'right'}]}>${formatCurrency(b.spent_amount)}</Text>
+                            <Text style={[styles.td, {flex: 1.5, textAlign: 'right', fontSize: 11}]}>
+                                ${formatCurrency(b.limit_amount)}
+                            </Text>
+                            <Text style={[styles.td, {width: 40, textAlign: 'right', fontSize: 10}]}>{pct}%</Text>
+                            
+                            <View style={{width: 60, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center'}}>
+                              {b.is_debt ? (
+                                b.debt_status === 'paid' ? (
+                                  <FontAwesome name="check-circle" size={20} color="#00D09E" style={{marginRight: 8}} />
+                                ) : (
+                                  <TouchableOpacity onPress={() => markDebtPaid(b)} style={{padding: 6}}>
+                                    <FontAwesome name="money" size={16} color="#FFD700" />
+                                  </TouchableOpacity>
+                                )
+                              ) : (
+                                <>
+                                  <TouchableOpacity 
+                                    activeOpacity={0.5}
+                                    onPressIn={() => { setIsDragging(true); onDragStart(); }}
+                                    onPressOut={() => { setIsDragging(false); onDragEnd(); }}
+                                    style={{padding: 10}}
+                                  >
+                                    <FontAwesome name="bars" size={16} color={isActive ? '#00D09E' : '#888'} />
+                                  </TouchableOpacity>
+                                  <TouchableOpacity onPress={() => openEditModal(b)} style={{padding: 6}}>
+                                    <FontAwesome name="cog" size={14} color="#AAA" />
+                                  </TouchableOpacity>
+                                </>
+                              )}
+                            </View>
                           </View>
+
+                          {/* Progress Bar for regular Budgets */}
+                          {!b.is_debt && b.limit_amount > 0 && (
+                            <View style={{marginTop: 6, height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
+                              <View style={{height: '100%', width: `${numericPct}%`, backgroundColor: indicatorColor, borderRadius: 2}} />
+                            </View>
+                          )}
+
+                          {b.is_debt && limitVal > 0 && (
+                            <View style={{marginTop: 6, borderTopWidth: 1, borderTopColor: '#333', paddingTop: 6}}>
+                              <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 2}}>
+                                <Text style={{color: '#888', fontSize: 10}}>Límite de Crédito: ${formatCurrency(limitVal)}</Text>
+                                <Text style={{color: '#888', fontSize: 10}}>Uso: ${formatCurrency(usedVal)} ({creditPct}%)</Text>
+                              </View>
+                              <View style={{height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
+                                <View style={{height: '100%', width: `${creditPct}%`, backgroundColor: creditPct > 85 ? '#FF4C4C' : '#00D09E', borderRadius: 2}} />
+                              </View>
+                            </View>
+                          )}
                         </View>
+                      </TouchableOpacity>
 
-                        {/* Progress Bar for regular Budgets */}
-                        {!b.is_debt && b.limit_amount > 0 && (
-                          <View style={{marginTop: 6, height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
-                            <View style={{height: '100%', width: `${numericPct}%`, backgroundColor: indicatorColor, borderRadius: 2}} />
-                          </View>
-                        )}
-
-                        {b.is_debt && limitVal > 0 && (
-                          <View style={{marginTop: 6, borderTopWidth: 1, borderTopColor: '#333', paddingTop: 6}}>
-                            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 2}}>
-                              <Text style={{color: '#888', fontSize: 10}}>Límite de Crédito: ${formatCurrency(limitVal)}</Text>
-                              <Text style={{color: '#888', fontSize: 10}}>Uso: ${formatCurrency(usedVal)} ({creditPct}%)</Text>
+                      {/* Renderizado de cuotas individuales en desglose */}
+                      {isExpanded && b.installments && b.installments.map((inst: any) => {
+                        const instPaid = inst.status === 'paid';
+                        const instBg = 'rgba(255, 255, 255, 0.03)';
+                        return (
+                          <View 
+                            key={inst.id} 
+                            style={{ 
+                              flexDirection: 'row', 
+                              backgroundColor: instBg, 
+                              paddingVertical: 10, 
+                              paddingHorizontal: 16, 
+                              borderBottomWidth: 1, 
+                              borderBottomColor: '#222',
+                              alignItems: 'center',
+                              paddingLeft: 30
+                            }}
+                          >
+                            <FontAwesome name="circle" size={6} color={instPaid ? '#00D09E' : '#FF4C4C'} style={{marginRight: 10}} />
+                            <View style={{flex: 2}}>
+                              <Text style={{color: '#FFF', fontSize: 11, fontWeight: 'bold'}} numberOfLines={1}>{inst.description}</Text>
+                              <Text style={{color: '#888', fontSize: 9}}>Cuota {inst.installment_number}/{inst.total_installments}</Text>
                             </View>
-                            <View style={{height: 4, backgroundColor: '#222', borderRadius: 2, overflow: 'hidden'}}>
-                              <View style={{height: '100%', width: `${creditPct}%`, backgroundColor: creditPct > 85 ? '#FF4C4C' : '#00D09E', borderRadius: 2}} />
+                            <Text style={{color: '#FFF', fontSize: 11, flex: 1.5, textAlign: 'right'}}>${formatCurrency(inst.amount)}</Text>
+                            <View style={{width: 60, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center'}}>
+                              {instPaid ? (
+                                <FontAwesome name="check-circle" size={18} color="#00D09E" style={{marginRight: 8}} />
+                              ) : (
+                                <TouchableOpacity 
+                                  onPress={() => markSingleInstallmentPaid(inst.id, `${b.category}: ${inst.description} (${inst.installment_number}/${inst.total_installments})`, inst.amount)} 
+                                  style={{padding: 6}}
+                                >
+                                  <FontAwesome name="money" size={14} color="#FFD700" />
+                                </TouchableOpacity>
+                              )}
                             </View>
                           </View>
-                        )}
-                      </View>
+                        );
+                      })}
                     </View>
                   );
                 }}
@@ -707,6 +769,99 @@ export default function BudgetsScreen() {
         </View>
       </Modal>
 
+      {/* Modal para Crear Presupuesto Compartido */}
+      <Modal
+        visible={showCreateSharedModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowCreateSharedModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Crear Presupuesto Compartido</Text>
+            <Text style={styles.modalLabel}>Nombre del presupuesto (ej. Hogar, Empresa)</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={newSharedName}
+              onChangeText={setNewSharedName}
+              placeholder="Nombre del presupuesto..."
+              placeholderTextColor="#666"
+            />
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#333', flex: 1 }]} onPress={() => setShowCreateSharedModal(false)}>
+                <Text style={{ color: '#FFF', fontWeight: 'bold' }}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#00D09E', flex: 1 }]} onPress={handleCreateSharedBudget}>
+                <Text style={{ color: '#000', fontWeight: 'bold' }}>Crear</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modal para Gestionar Miembros */}
+      <Modal
+        visible={showMembersModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowMembersModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <Text style={[styles.modalTitle, { marginBottom: 0 }]}>Miembros de {activeSharedBudget?.name}</Text>
+              <TouchableOpacity onPress={() => setShowMembersModal(false)}>
+                <FontAwesome name="close" size={20} color="#888" />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.modalLabel}>Invitar nuevo miembro</Text>
+            <View style={styles.inviteContainer}>
+              <TextInput
+                style={styles.inviteInput}
+                value={newMemberUsername}
+                onChangeText={setNewMemberUsername}
+                placeholder="Nick con @ (ej: @gabriel)..."
+                placeholderTextColor="#666"
+                autoCapitalize="none"
+              />
+              <TouchableOpacity style={styles.inviteBtn} onPress={handleAddMember}>
+                <Text style={styles.inviteBtnText}>Agregar</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={[styles.modalLabel, { marginTop: 16, marginBottom: 10 }]}>Miembros actuales</Text>
+            <ScrollView style={{ maxHeight: 200 }}>
+              {members.map((m) => (
+                <View key={m.id} style={styles.memberRow}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+                    {m.profiles?.avatar_url ? (
+                      <Image source={{ uri: m.profiles.avatar_url }} style={styles.memberAvatar} />
+                    ) : (
+                      <View style={styles.memberAvatarPlaceholder}>
+                        <FontAwesome name="user" size={12} color="#888" />
+                      </View>
+                    )}
+                    <View style={styles.memberInfo}>
+                      <Text style={styles.memberName}>{m.profiles?.full_name || 'Miembro Finiax'}</Text>
+                      <Text style={styles.memberHandle}>@{m.profiles?.username || 'sin_handle'}</Text>
+                    </View>
+                  </View>
+                  
+                  {m.role === 'owner' ? (
+                    <Text style={styles.memberRole}>Creador</Text>
+                  ) : (
+                    <TouchableOpacity style={styles.memberRemoveBtn} onPress={() => handleRemoveMember(m.user_id)}>
+                      <FontAwesome name="trash" size={14} color="#FF4C4C" />
+                    </TouchableOpacity>
+                  )}
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
     </KeyboardAvoidingView>
   );
 }
@@ -758,5 +913,147 @@ const styles = StyleSheet.create({
   paymentProgressBarContainer: { height: 6, backgroundColor: '#222', borderRadius: 3, overflow: 'hidden', marginBottom: 6 },
   paymentProgressBarFill: { height: '100%', backgroundColor: '#00D09E', borderRadius: 3 },
   paymentProgressFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  paymentProgressSubtext: { color: '#888', fontSize: 10 }
+  paymentProgressSubtext: { color: '#888', fontSize: 10 },
+
+  // Estilos Presupuesto Compartido
+  workspaceHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#111',
+    borderBottomWidth: 1,
+    borderBottomColor: '#222'
+  },
+  workspaceTabs: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  workspaceTab: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E1E1E',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333'
+  },
+  workspaceTabActive: {
+    backgroundColor: '#00D09E',
+    borderColor: '#00D09E'
+  },
+  workspaceTabText: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '600'
+  },
+  workspaceTabTextActive: {
+    color: '#121212',
+    fontWeight: 'bold'
+  },
+  addWorkspaceTab: {
+    backgroundColor: '#1A1A1A',
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#333',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginLeft: 4
+  },
+  manageMembersBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E1E1E',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333',
+    marginLeft: 12
+  },
+  manageMembersBtnText: {
+    color: '#00D09E',
+    fontSize: 12,
+    fontWeight: 'bold'
+  },
+  inviteContainer: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center'
+  },
+  inviteInput: {
+    flex: 1,
+    backgroundColor: '#222',
+    color: '#FFF',
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333'
+  },
+  inviteBtn: {
+    backgroundColor: '#00D09E',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center'
+  },
+  inviteBtnText: {
+    color: '#000',
+    fontWeight: 'bold',
+    fontSize: 12
+  },
+  memberRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#1E1E1E',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#333'
+  },
+  memberAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16
+  },
+  memberAvatarPlaceholder: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#222',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#333'
+  },
+  memberInfo: {
+    marginLeft: 10,
+    flex: 1
+  },
+  memberName: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: 'bold'
+  },
+  memberHandle: {
+    color: '#00D09E',
+    fontSize: 10,
+    marginTop: 1
+  },
+  memberRole: {
+    color: '#888',
+    fontSize: 11,
+    fontWeight: 'bold'
+  },
+  memberRemoveBtn: {
+    padding: 6
+  }
 });

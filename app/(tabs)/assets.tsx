@@ -1,4 +1,3 @@
-import { supabase } from '@/lib/supabase';
 import { formatCurrency, formatNumber } from '@/lib/utils';
 import { useAuth } from '@/providers/AuthProvider';
 import { FontAwesome } from '@expo/vector-icons';
@@ -6,21 +5,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Dimensions, Modal, RefreshControl, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { PieChart } from 'react-native-chart-kit';
-
-type Asset = {
-  id: string;
-  name: string;
-  symbol: string;
-  type: string; // 'crypto', 'stock', 'fiat', 'other'
-  quantity: number;
-  average_buy_price: number;
-  current_price?: number;
-  is_autoprestamo?: boolean;
-  is_mercado_pago?: boolean;
-  base_quantity?: number;
-  base_invested?: number;
-  autoprestamos_deducted?: number;
-};
+import { AssetService, Asset } from '@/lib/services/AssetService';
+import { supabase } from '@/lib/supabase';
 
 type DisplayCurrency = 'ARS' | 'USD' | 'EUR' | 'BRL' | 'BTC' | 'ETH';
 type NativeCurrency = 'ARS' | 'USD' | 'EUR' | 'BRL';
@@ -91,48 +77,6 @@ export default function AssetsScreen() {
   const [isEditingGoal, setIsEditingGoal] = useState(false);
   const [goalInput, setGoalInput] = useState('');
 
-  // Identificadores de tipos de activos y moneda nativa
-  const isUSDAsset = useCallback((symbol: string, name: string) => {
-    if (!symbol) return false;
-    const sym = symbol.toUpperCase().trim();
-    const n = (name || '').toLowerCase().trim();
-    return (
-      sym.startsWith('USD:') ||
-      sym.startsWith('EUR:') ||
-      sym.startsWith('BRL:') ||
-      sym === 'BTC' ||
-      sym === 'ETH' ||
-      sym === 'BNB' ||
-      sym === 'USDT' ||
-      sym === 'SOL' ||
-      sym === 'SIMPLESTATE' ||
-      sym.includes('USD') ||
-      n.includes('dolar') ||
-      n.includes('crypto')
-    );
-  }, []);
-
-  const getAssetNativeCurrency = useCallback((symbol: string): NativeCurrency => {
-    if (!symbol) return 'ARS';
-    const sym = symbol.toUpperCase().trim();
-    if (sym.startsWith('USD:')) return 'USD';
-    if (sym.startsWith('EUR:')) return 'EUR';
-    if (sym.startsWith('BRL:')) return 'BRL';
-    if (sym.startsWith('ARS:')) return 'ARS';
-    // Fallback heurístico
-    if (isUSDAsset(symbol, '')) return 'USD';
-    return 'ARS';
-  }, [isUSDAsset]);
-
-  const getCleanSymbol = useCallback((symbol: string): string => {
-    if (!symbol) return '';
-    const parts = symbol.split(':');
-    if (parts.length > 1 && ['USD', 'EUR', 'BRL', 'ARS'].includes(parts[0].toUpperCase())) {
-      return parts.slice(1).join(':');
-    }
-    return symbol;
-  }, []);
-
   const convertFromARS = useCallback((valueARS: number, target: DisplayCurrency): number => {
     if (target === 'ARS') return valueARS;
     
@@ -158,7 +102,7 @@ export default function AssetsScreen() {
   }, [exchangeRate, eurRate, brlRate, btcUsdPrice, ethUsdPrice]);
 
   const convertAsset = useCallback((asset: Asset) => {
-    const nativeCur = getAssetNativeCurrency(asset.symbol);
+    const nativeCur = AssetService.getAssetNativeCurrency(asset.symbol);
     
     let currentValueARS = 0;
     let investedValueARS = 0;
@@ -183,7 +127,7 @@ export default function AssetsScreen() {
       }
     } else {
       // Acciones/Crypto (almacenados ya en moneda correspondiente: crypto en USD, stocks en ARS)
-      const isUSD = isUSDAsset(asset.symbol, asset.name);
+      const isUSD = AssetService.isUSDAsset(asset.symbol, asset.name);
       const currentPrice = asset.current_price || asset.average_buy_price;
       
       if (isUSD) {
@@ -204,17 +148,7 @@ export default function AssetsScreen() {
       currentValueARS,
       investedValueARS,
     };
-  }, [getAssetNativeCurrency, isUSDAsset, exchangeRate, eurRate, brlRate]);
-
-  const isCryptoSymbol = (symbol: string): boolean => {
-    return ['BTC', 'ETH', 'BNB', 'USDT', 'SOL'].includes(symbol.toUpperCase().trim());
-  };
-
-  const isStockSymbol = (symbol: string): boolean => {
-    return [
-      'MMM', 'T', 'AAPL', 'CVX', 'KO', 'CL', 'QQQ', 'SPY', 'XOM', 'JNJ', 'MCD', 'MSFT', 'PEP', 'PFE', 'PG', 'SBUX', 'STBUX', 'UL', 'VZ', 'WMT'
-    ].includes(symbol.toUpperCase().trim());
-  };
+  }, [exchangeRate, eurRate, brlRate]);
 
   // Carga inicial y configuraciones
   useEffect(() => {
@@ -262,175 +196,21 @@ export default function AssetsScreen() {
     }
   };
 
-  // Buscador de precios de CEDEARs en Yahoo Finance (BCBA) con CORS Proxy fallback
-  const fetchStockPrice = async (symbol: string): Promise<number | null> => {
-    let querySym = symbol.toUpperCase().trim();
-    if (querySym === 'S&P500' || querySym === 'SP500') {
-      querySym = 'SPY';
-    }
-    if (querySym === 'STBUX') {
-      querySym = 'SBUX';
-    }
-    const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${querySym}.BA`;
-
-    // Intento 1: Fetch directo (por ejemplo en móvil o Node)
-    try {
-      const res = await fetch(targetUrl);
-      if (res.ok) {
-        const text = await res.text();
-        if (text && text.trim()) {
-          const data = JSON.parse(text);
-          if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
-            return Number(data.chart.result[0].meta.regularMarketPrice);
-          }
-        }
-      }
-    } catch (e) {
-      // Intento 2: Fallback por corsproxy.io (Proxy rápido)
-      try {
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
-        const res = await fetch(proxyUrl);
-        if (res.ok) {
-          const text = await res.text();
-          if (text && text.trim()) {
-            const data = JSON.parse(text);
-            if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
-              return Number(data.chart.result[0].meta.regularMarketPrice);
-            }
-          }
-        }
-      } catch (proxyError1) {
-        // Intento 3: Fallback por allorigins.win (De respaldo)
-        try {
-          const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-          const res = await fetch(proxyUrl);
-          if (res.ok) {
-            const text = await res.text();
-            if (text && text.trim()) {
-              const data = JSON.parse(text);
-              if (data?.chart?.result?.[0]?.meta?.regularMarketPrice) {
-                return Number(data.chart.result[0].meta.regularMarketPrice);
-              }
-            }
-          }
-        } catch (proxyError2) {
-          console.warn(`No se pudo obtener el precio de la acción ${symbol} tras probar múltiples proxies:`, proxyError2);
-        }
-      }
-    }
-    return null;
-  };
-
-  // Buscador de precios Crypto
-  const fetchCryptoPrices = async (symbols: string[]): Promise<Record<string, number>> => {
-    if (!symbols.length) return {};
-    try {
-      const symList = symbols.map(s => s.toUpperCase()).join(',');
-      const res = await fetch(`https://min-api.cryptocompare.com/data/pricemulti?fsyms=${symList}&tsyms=USD`);
-      const data = await res.json();
-      const prices: Record<string, number> = {};
-      symbols.forEach(sym => {
-        const upperSym = sym.toUpperCase();
-        if (data[upperSym] && data[upperSym].USD) {
-          prices[sym.toLowerCase()] = Number(data[upperSym].USD);
-        }
-      });
-      return prices;
-    } catch (e) {
-      console.warn('Error al obtener precios de criptomonedas:', e);
-      return {};
-    }
-  };
-
-  // Buscador de Tipo de Cambio Dólar CCL
-  const fetchExchangeRate = async () => {
-    try {
-      const res = await fetch('https://dolarapi.com/v1/dolares/ccl');
-      if (res.ok) {
-        const text = await res.text();
-        if (text && text.trim()) {
-          const data = JSON.parse(text);
-          if (data && data.venta) {
-            setExchangeRate(Number(data.venta));
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('Error obteniendo dólar CCL, usando fallback 1350:', e);
-    }
-  };
-
-  const fetchAdditionalRates = async () => {
-    try {
-      // 1. Euro
-      try {
-        const res = await fetch('https://dolarapi.com/v1/dolares/euro');
-        if (res.ok) {
-          const text = await res.text();
-          if (text && text.trim()) {
-            const data = JSON.parse(text);
-            if (data && data.venta) {
-              setEurRate(Number(data.venta));
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Error fetching EUR/ARS rate:', e);
-      }
-
-      // 2. Real Brasilero
-      try {
-        const res = await fetch('https://open.er-api.com/v6/latest/BRL');
-        if (res.ok) {
-          const text = await res.text();
-          if (text && text.trim()) {
-            const data = JSON.parse(text);
-            if (data && data.rates && data.rates.ARS) {
-              setBrlRate(Number(data.rates.ARS));
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Error fetching BRL/ARS rate:', e);
-      }
-
-      // 3. Cryptos para visualización (BTC/USD y ETH/USD)
-      try {
-        const res = await fetch('https://min-api.cryptocompare.com/data/pricemulti?fsyms=BTC,ETH&tsyms=USD');
-        if (res.ok) {
-          const text = await res.text();
-          if (text && text.trim()) {
-            const data = JSON.parse(text);
-            if (data) {
-              if (data.BTC && data.BTC.USD) setBtcUsdPrice(Number(data.BTC.USD));
-              if (data.ETH && data.ETH.USD) setEthUsdPrice(Number(data.ETH.USD));
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Error fetching crypto display rates:', e);
-      }
-    } catch (e) {
-      console.warn('General error fetching additional rates:', e);
-    }
-  };
-
   const loadData = async () => {
     setLoading(true);
-    await Promise.all([
-      fetchExchangeRate(),
-      fetchAdditionalRates()
-    ]);
-
     try {
-      // 1. Cargar activos desde Supabase
-      const { data: assetsData, error: assetsError } = await supabase
-        .from('assets')
-        .select('*')
-        .eq('user_id', session!.user.id);
+      const liveRate = await AssetService.fetchExchangeRate();
+      setExchangeRate(liveRate);
+      
+      const rates = await AssetService.fetchAdditionalRates();
+      setEurRate(rates.eur);
+      setBrlRate(rates.brl);
+      setBtcUsdPrice(rates.btc);
+      setEthUsdPrice(rates.eth);
 
-      if (assetsError) throw assetsError;
-      setRawAssets(assetsData || []);
+      // 1. Cargar activos desde Supabase
+      const assetsData = await AssetService.getAssets(session!.user.id);
+      setRawAssets(assetsData);
 
       // 2. Cargar todas las cuotas de deudas pendientes
       const { data: debtsData, error: debtsError } = await supabase
@@ -461,14 +241,14 @@ export default function AssetsScreen() {
       const items: Asset[] = assetsData || [];
 
       // Extraer símbolos para buscar precios
-      const cryptoSymbols = items.filter(a => a.type === 'crypto' || isCryptoSymbol(a.symbol)).map(a => a.symbol);
-      const stockSymbols = items.filter(a => a.type === 'stock' || isStockSymbol(a.symbol)).map(a => a.symbol);
+      const cryptoSymbols = items.filter(a => a.type === 'crypto' || AssetService.isCryptoSymbol(a.symbol)).map(a => a.symbol);
+      const stockSymbols = items.filter(a => a.type === 'stock' || AssetService.isStockSymbol(a.symbol)).map(a => a.symbol);
 
       // Fetch paralelo de precios
       const [cryptosMap, stocksPricesList] = await Promise.all([
-        fetchCryptoPrices(cryptoSymbols),
+        AssetService.fetchCryptoPrices(cryptoSymbols),
         Promise.all(stockSymbols.map(async sym => {
-          const price = await fetchStockPrice(sym);
+          const price = await AssetService.fetchStockPrice(sym);
           return { symbol: sym, price };
         }))
       ]);
@@ -518,7 +298,7 @@ export default function AssetsScreen() {
         }
 
         // CASO: Criptomonedas (Precios en vivo en USD)
-        if (item.type === 'crypto' || isCryptoSymbol(sym)) {
+        if (item.type === 'crypto' || AssetService.isCryptoSymbol(sym)) {
           const livePrice = cryptosMap[item.symbol.toLowerCase()] || item.average_buy_price;
           return {
             ...item,
@@ -527,7 +307,7 @@ export default function AssetsScreen() {
         }
 
         // CASO: Acciones (Precios en vivo en ARS)
-        if (item.type === 'stock' || isStockSymbol(sym)) {
+        if (item.type === 'stock' || AssetService.isStockSymbol(sym)) {
           const livePrice = stocksMap[item.symbol.toLowerCase()] || item.average_buy_price;
           return {
             ...item,
@@ -581,10 +361,10 @@ export default function AssetsScreen() {
 
     setEditingAsset(rawAsset);
     setFormName(rawAsset.name);
-    setFormSymbol(getCleanSymbol(rawAsset.symbol));
+    setFormSymbol(AssetService.getCleanSymbol(rawAsset.symbol));
     setFormType(rawAsset.type);
 
-    const nativeCur = getAssetNativeCurrency(rawAsset.symbol);
+    const nativeCur = AssetService.getAssetNativeCurrency(rawAsset.symbol);
     setFormCurrency(nativeCur);
 
     if (rawAsset.type === 'fiat' || rawAsset.type === 'other') {
@@ -640,33 +420,24 @@ export default function AssetsScreen() {
     try {
       if (editingAsset) {
         // ACTUALIZAR ACTIVO EXISTENTE
-        const { error } = await supabase
-          .from('assets')
-          .update({
-            name: formName,
-            symbol: finalSymbol,
-            type: formType,
-            quantity: qty,
-            average_buy_price: avgPrice
-          })
-          .eq('id', editingAsset.id);
-
-        if (error) throw error;
+        await AssetService.saveAsset(session!.user.id, {
+          id: editingAsset.id,
+          name: formName,
+          symbol: finalSymbol,
+          type: formType,
+          quantity: qty,
+          average_buy_price: avgPrice
+        });
         Alert.alert('Éxito', 'Activo actualizado correctamente');
       } else {
         // AÑADIR NUEVO ACTIVO
-        const { error } = await supabase
-          .from('assets')
-          .insert({
-            user_id: session!.user.id,
-            name: formName,
-            symbol: finalSymbol,
-            type: formType,
-            quantity: qty,
-            average_buy_price: avgPrice
-          });
-
-        if (error) throw error;
+        await AssetService.saveAsset(session!.user.id, {
+          name: formName,
+          symbol: finalSymbol,
+          type: formType,
+          quantity: qty,
+          average_buy_price: avgPrice
+        });
         Alert.alert('Éxito', 'Activo añadido correctamente');
       }
 
@@ -688,12 +459,7 @@ export default function AssetsScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const { error } = await supabase
-                .from('assets')
-                .delete()
-                .eq('id', id);
-
-              if (error) throw error;
+              await AssetService.deleteAsset(id);
               setIsModalVisible(false);
               loadData();
             } catch (e: any) {
@@ -714,7 +480,7 @@ export default function AssetsScreen() {
   const dollarsAssetsList: any[] = [];
 
   assets.forEach(asset => {
-    const isUSD = isUSDAsset(asset.symbol, asset.name);
+    const isUSD = AssetService.isUSDAsset(asset.symbol, asset.name);
     const { currentValueARS, investedValueARS } = convertAsset(asset);
 
     totalARS_Current += currentValueARS;
@@ -736,7 +502,7 @@ export default function AssetsScreen() {
       profit: dispProfit,
       profitPercentage: profitPct,
       unitPrice: dispUnitPrice,
-      nativeCurrency: getAssetNativeCurrency(asset.symbol),
+      nativeCurrency: AssetService.getAssetNativeCurrency(asset.symbol),
       currentValueARS,
       investedValueARS
     };
@@ -885,7 +651,7 @@ export default function AssetsScreen() {
   let totalARS_USDOnly = 0;
   assets.forEach(asset => {
     const { currentValueARS } = convertAsset(asset);
-    if (isUSDAsset(asset.symbol, asset.name)) {
+    if (AssetService.isUSDAsset(asset.symbol, asset.name)) {
       totalARS_USDOnly += currentValueARS;
     } else {
       totalARS_PesosOnly += currentValueARS;
@@ -1223,8 +989,8 @@ export default function AssetsScreen() {
         <View style={styles.assetsList}>
           {pesosAssetsList.map((asset) => {
             const isPositive = asset.profit >= 0;
-            const cleanSym = getCleanSymbol(asset.symbol);
-            const nativeCur = getAssetNativeCurrency(asset.symbol);
+            const cleanSym = AssetService.getCleanSymbol(asset.symbol);
+            const nativeCur = AssetService.getAssetNativeCurrency(asset.symbol);
             return (
               <TouchableOpacity key={asset.id} style={styles.assetItemCard} onPress={() => handleOpenEditModal(asset)}>
                 <View style={styles.assetItemHeader}>
@@ -1292,8 +1058,8 @@ export default function AssetsScreen() {
         <View style={styles.assetsList}>
           {dollarsAssetsList.map((asset) => {
             const isPositive = asset.profit >= 0;
-            const cleanSym = getCleanSymbol(asset.symbol);
-            const nativeCur = getAssetNativeCurrency(asset.symbol);
+            const cleanSym = AssetService.getCleanSymbol(asset.symbol);
+            const nativeCur = AssetService.getAssetNativeCurrency(asset.symbol);
             return (
               <TouchableOpacity key={asset.id} style={styles.assetItemCard} onPress={() => handleOpenEditModal(asset)}>
                 <View style={styles.assetItemHeader}>

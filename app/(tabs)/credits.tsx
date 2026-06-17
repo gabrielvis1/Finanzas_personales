@@ -1,18 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, TextInput, ActivityIndicator, Alert, ScrollView, Modal, KeyboardAvoidingView, Platform } from 'react-native';
-import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/providers/AuthProvider';
 import { FontAwesome } from '@expo/vector-icons';
-
-type CreditLine = {
-  id: string;
-  name: string;
-  type: 'credit_card' | 'loan';
-  limit_amount: number | null;
-  cut_off_day: number | null;
-  payment_due_day: number | null;
-  icon: string | null;
-};
+import { CreditLineService, CreditLine } from '@/lib/services/CreditLineService';
 
 const ICONS = [
   'credit-card', 'credit-card-alt', 'bank', 'money', 'building', 'car', 'motorcycle',
@@ -42,16 +32,11 @@ export default function CreditsScreen() {
 
   const loadCreditLines = async () => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from('credit_lines')
-      .select('*')
-      .eq('user_id', session!.user.id)
-      .order('created_at', { ascending: true });
-
-    if (error) {
+    try {
+      const data = await CreditLineService.getCreditLines(session!.user.id);
+      setCreditLines(data);
+    } catch (error: any) {
       Alert.alert('Error', error.message);
-    } else {
-      setCreditLines(data || []);
     }
     setLoading(false);
   };
@@ -83,43 +68,46 @@ export default function CreditsScreen() {
       return;
     }
 
-    const payload = {
-      user_id: session!.user.id,
-      name: formName,
-      type: formType,
-      limit_amount: formLimit ? Number(formLimit) : null,
-      cut_off_day: formCutOff ? Number(formCutOff) : null,
-      payment_due_day: formDue ? Number(formDue) : null,
-      icon: formIcon
-    };
-
-    if (editingId) {
-      const { error } = await supabase.from('credit_lines').update(payload).eq('id', editingId);
-      if (error) Alert.alert('Error', error.message);
-    } else {
-      const { error } = await supabase.from('credit_lines').insert(payload);
-      if (error) Alert.alert('Error', error.message);
+    try {
+      await CreditLineService.saveCreditLine(session!.user.id, {
+        id: editingId,
+        name: formName,
+        type: formType,
+        limit_amount: formLimit ? Number(formLimit) : null,
+        cut_off_day: formCutOff ? Number(formCutOff) : null,
+        payment_due_day: formDue ? Number(formDue) : null,
+        icon: formIcon
+      });
+      setModalVisible(false);
+      loadCreditLines();
+    } catch (error: any) {
+      Alert.alert('Error', error.message);
     }
-
-    setModalVisible(false);
-    loadCreditLines();
   };
 
   const deleteCreditLine = async (id: string) => {
     if (Platform.OS === 'web') {
       if (window.confirm('¿Seguro que deseas eliminar esta línea de crédito?')) {
-        await supabase.from('credit_lines').delete().eq('id', id);
-        setModalVisible(false);
-        loadCreditLines();
+        try {
+          await CreditLineService.deleteCreditLine(id);
+          setModalVisible(false);
+          loadCreditLines();
+        } catch (error: any) {
+          Alert.alert('Error', error.message);
+        }
       }
       return;
     }
     Alert.alert('Eliminar', '¿Estás seguro?', [
       { text: 'Cancelar', style: 'cancel' },
       { text: 'Eliminar', style: 'destructive', onPress: async () => {
-          await supabase.from('credit_lines').delete().eq('id', id);
-          setModalVisible(false);
-          loadCreditLines();
+          try {
+            await CreditLineService.deleteCreditLine(id);
+            setModalVisible(false);
+            loadCreditLines();
+          } catch (error: any) {
+            Alert.alert('Error', error.message);
+          }
       }}
     ]);
   };

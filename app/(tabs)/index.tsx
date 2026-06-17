@@ -1,12 +1,15 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useFocusEffect } from 'expo-router';
-import { StyleSheet, View, Text, ScrollView, RefreshControl, Dimensions, TouchableOpacity, LogBox } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, RefreshControl, Dimensions, TouchableOpacity, LogBox, Modal } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { FontAwesome } from '@expo/vector-icons';
 import { PieChart, LineChart } from 'react-native-chart-kit';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/providers/AuthProvider';
 import { formatCurrency, formatNumber } from '@/lib/utils';
+import { TransactionService } from '@/lib/services/TransactionService';
+import { CreditLineService } from '@/lib/services/CreditLineService';
+import { AssetService } from '@/lib/services/AssetService';
 
 // Ignorar advertencias específicas de React Native Web y SVG de librerías de terceros
 LogBox.ignoreLogs(['Unknown event handler property']);
@@ -68,6 +71,8 @@ export default function DashboardScreen() {
   const [expenseBreakdown, setExpenseBreakdown] = useState<any[]>([]);
   const [detailedDebts, setDetailedDebts] = useState<any[]>([]);
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
+  const [overdueAlerts, setOverdueAlerts] = useState<any[]>([]);
+  const [showAlertsModal, setShowAlertsModal] = useState(false);
 
   // Estados del Comparador de Temporadas (Periodo B)
   const [compareMonthB, setCompareMonthB] = useState(
@@ -108,14 +113,14 @@ export default function DashboardScreen() {
     const endOfMonth = new Date(currentYear, currentMonth + 1, 0, 23, 59, 59).toISOString();
 
     // 1. Obtener transacciones del mes activo
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('id, name, amount, type, payment_method, category, date, description')
-      .eq('user_id', session.user.id)
-      .gte('date', startOfMonth)
-      .lte('date', endOfMonth);
+    let data;
+    try {
+      data = await TransactionService.getTransactionsByDateRange(session.user.id, startOfMonth, endOfMonth);
+    } catch (e) {
+      console.warn('Error fetching transactions:', e);
+    }
       
-    if (data && !error) {
+    if (data) {
       let inc = 0, exp = 0;
       const catMap: Record<string, number> = {};
       const transactionsByCat: Record<string, any[]> = {};
@@ -176,16 +181,22 @@ export default function DashboardScreen() {
 
     // 2. Obtener Deudas Pendientes (vigentes y atrasadas) y calcular total de deudas vigentes
     let activeDebtsSum = 0;
-    const { data: allDebtData, error: debtErr } = await supabase
-      .from('debt_installments')
-      .select('*, credit_lines(name, type)')
-      .eq('user_id', session.user.id)
-      .eq('status', 'pending');
+    let allDebtData: any[] = [];
+    try {
+      allDebtData = await CreditLineService.getPendingInstallments(session.user.id);
+    } catch (e) {
+      console.warn('Error fetching pending installments:', e);
+    }
       
-    if (allDebtData && !debtErr) {
+    if (allDebtData && allDebtData.length > 0) {
       const currentAndOverdue = allDebtData.filter(d => {
         return d.year < currentYear || (d.year === currentYear && d.month <= currentMonth + 1);
       });
+      
+      const overdue = allDebtData.filter(d => {
+        return d.year < currentYear || (d.year === currentYear && d.month < currentMonth + 1);
+      });
+      setOverdueAlerts(overdue);
       
       currentAndOverdue.forEach(d => activeDebtsSum += Number(d.amount));
       setDebts(activeDebtsSum);
@@ -203,12 +214,13 @@ export default function DashboardScreen() {
     } else {
       setDebts(0);
       setDetailedDebts([]);
+      setOverdueAlerts([]);
     }
 
     // 3. Obtener deudas totales de la base de datos (todas las cuotas pendientes) para patrimonio neto
     let allPendingDebtsSum = 0;
     let totalAutoprestamos = 0;
-    if (allDebtData && !debtErr) {
+    if (allDebtData && allDebtData.length > 0) {
       allDebtData.forEach(d => {
         const amt = Number(d.amount);
         allPendingDebtsSum += amt;
@@ -221,10 +233,7 @@ export default function DashboardScreen() {
 
     // 4. Obtener Activos y calcular valorización en ARS (utilizando ccl rate y live prices aproximados)
     try {
-      const { data: assetsData } = await supabase
-        .from('assets')
-        .select('*')
-        .eq('user_id', session.user.id);
+      const assetsData = await AssetService.getAssets(session.user.id);
 
       // Obtener cotizaciones de dolarapi ccl
       let cclRate = 1350;
@@ -295,39 +304,14 @@ export default function DashboardScreen() {
       const startB = new Date(compareYearB, compareMonthB, 1).toISOString();
       const endB = new Date(compareYearB, compareMonthB + 1, 0, 23, 59, 59).toISOString();
 
-      const { data: dataA, error: errA } = await supabase
-        .from('transactions')
-        .select('amount, type, date, payment_method')
-        .eq('user_id', session.user.id)
-        .gte('date', startA)
-        .lte('date', endA);
-
-      const { data: dataB, error: errB } = await supabase
-        .from('transactions')
-        .select('amount, type, date, payment_method')
-        .eq('user_id', session.user.id)
-        .gte('date', startB)
-        .lte('date', endB);
+      const dataA = await TransactionService.getTransactionsByDateRange(session.user.id, startA, endA);
+      const dataB = await TransactionService.getTransactionsByDateRange(session.user.id, startB, endB);
 
       // Obtener deudas del Periodo A
-      const { data: debtsDataA, error: debtsErrA } = await supabase
-        .from('debt_installments')
-        .select('amount')
-        .eq('user_id', session.user.id)
-        .eq('month', currentMonth + 1)
-        .eq('year', currentYear);
+      const debtsDataA = await CreditLineService.getInstallmentsByMonth(session.user.id, currentMonth + 1, currentYear);
 
       // Obtener deudas del Periodo B
-      const { data: debtsDataB, error: debtsErrB } = await supabase
-        .from('debt_installments')
-        .select('amount')
-        .eq('user_id', session.user.id)
-        .eq('month', compareMonthB + 1)
-        .eq('year', compareYearB);
-
-      if (errA || errB || debtsErrA || debtsErrB) {
-        throw new Error(errA?.message || errB?.message || debtsErrA?.message || debtsErrB?.message);
-      }
+      const debtsDataB = await CreditLineService.getInstallmentsByMonth(session.user.id, compareMonthB + 1, compareYearB);
 
       let incA = 0, expA = 0;
       const expAIntervals = [0, 0, 0, 0, 0, 0];
@@ -551,7 +535,21 @@ export default function DashboardScreen() {
     >
       {/* Selector de Mes */}
       <View style={styles.headerRow}>
-        <Text style={styles.title}>Hola, de nuevo 👋</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          <Text style={styles.title}>Hola, de nuevo 👋</Text>
+          <TouchableOpacity 
+            onPress={() => setShowAlertsModal(true)} 
+            style={styles.notificationBell}
+            activeOpacity={0.7}
+          >
+            <FontAwesome name="bell" size={18} color={overdueAlerts.length > 0 ? '#FF4C4C' : '#AAA'} />
+            {overdueAlerts.length > 0 && (
+              <View style={styles.bellBadge}>
+                <Text style={styles.bellBadgeText}>{overdueAlerts.length}</Text>
+              </View>
+            )}
+          </TouchableOpacity>
+        </View>
         <View style={styles.monthSelector}>
           <TouchableOpacity onPress={() => changeMonth(-1)} style={{padding: 5}}>
             <FontAwesome name="chevron-left" size={14} color="#00D09E" />
@@ -1003,6 +1001,69 @@ export default function DashboardScreen() {
         )}
       </View>
 
+      {/* Modal de Alertas de Notificación (Cuotas Atrasadas) */}
+      <Modal
+        visible={showAlertsModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowAlertsModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                <FontAwesome name="bell" size={20} color="#FF4C4C" />
+                <Text style={styles.modalTitle}>Notificaciones</Text>
+              </View>
+              <TouchableOpacity onPress={() => setShowAlertsModal(false)} style={styles.modalCloseButton}>
+                <FontAwesome name="times" size={18} color="#AAA" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.modalBody} contentContainerStyle={{ paddingBottom: 24 }}>
+              {overdueAlerts.length > 0 ? (
+                <>
+                  <Text style={styles.overdueAlertTitle}>Tienes cuotas de pago atrasadas</Text>
+                  <Text style={styles.overdueAlertSubtitle}>
+                    Las siguientes cuotas de tus líneas de crédito han superado su fecha de vencimiento:
+                  </Text>
+                  {overdueAlerts.map((alert) => (
+                    <View key={alert.id} style={styles.alertCard}>
+                      <View style={styles.alertCardHeader}>
+                        <Text style={styles.alertCreditLineName}>
+                          {alert.credit_lines?.name || 'Línea de Crédito'}
+                        </Text>
+                        <Text style={styles.alertAmount}>
+                          ${formatCurrency(Number(alert.amount))}
+                        </Text>
+                      </View>
+                      <Text style={styles.alertDescription}>{alert.description}</Text>
+                      <View style={styles.alertFooter}>
+                        <View style={styles.alertDateBadge}>
+                          <FontAwesome name="calendar-o" size={10} color="#FF4C4C" style={{ marginRight: 6 }} />
+                          <Text style={styles.alertDateText}>
+                            Venció: {alert.month}/{alert.year}
+                          </Text>
+                        </View>
+                        <Text style={styles.alertStatusText}>ATRASADO</Text>
+                      </View>
+                    </View>
+                  ))}
+                </>
+              ) : (
+                <View style={styles.emptyAlertsContainer}>
+                  <FontAwesome name="check-circle" size={48} color="#00D09E" />
+                  <Text style={styles.emptyAlertsTitle}>¡Todo al día!</Text>
+                  <Text style={styles.emptyAlertsText}>
+                    No tienes cuotas atrasadas pendientes de pago.
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
       <View style={{height: 60}} />
     </ScrollView>
   );
@@ -1156,5 +1217,151 @@ const styles = StyleSheet.create({
   chartTotalSumRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, paddingHorizontal: 4 },
   chartTotalSumLabel: { color: '#888', fontSize: 12 },
   chartTotalSumBadge: { backgroundColor: 'rgba(0, 208, 158, 0.15)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6 },
-  chartTotalSumValue: { color: '#00D09E', fontSize: 12, fontWeight: 'bold' }
+  chartTotalSumValue: { color: '#00D09E', fontSize: 12, fontWeight: 'bold' },
+
+  // Estilos de la campana y modal de alertas
+  notificationBell: {
+    padding: 8,
+    position: 'relative',
+    backgroundColor: '#1E1E1E',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#333',
+    justifyContent: 'center',
+    alignItems: 'center'
+  },
+  bellBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    backgroundColor: '#FF4C4C',
+    borderRadius: 8,
+    minWidth: 16,
+    height: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 4
+  },
+  bellBadgeText: {
+    color: '#FFF',
+    fontSize: 9,
+    fontWeight: 'bold'
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20
+  },
+  modalContent: {
+    width: '100%',
+    maxHeight: '80%',
+    backgroundColor: '#151515',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#333',
+    overflow: 'hidden'
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2E2E2E'
+  },
+  modalTitle: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: 'bold'
+  },
+  modalCloseButton: {
+    padding: 8
+  },
+  modalBody: {
+    padding: 16
+  },
+  overdueAlertTitle: {
+    color: '#FF4C4C',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 8
+  },
+  overdueAlertSubtitle: {
+    color: '#AAA',
+    fontSize: 13,
+    marginBottom: 16,
+    lineHeight: 18
+  },
+  alertCard: {
+    backgroundColor: '#1E1E1E',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 76, 76, 0.3)'
+  },
+  alertCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6
+  },
+  alertCreditLineName: {
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: 'bold'
+  },
+  alertAmount: {
+    color: '#FF4C4C',
+    fontSize: 14,
+    fontWeight: 'bold'
+  },
+  alertDescription: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 10
+  },
+  alertFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center'
+  },
+  alertDateBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 76, 76, 0.1)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6
+  },
+  alertDateText: {
+    color: '#FF4C4C',
+    fontSize: 10,
+    fontWeight: 'bold'
+  },
+  alertStatusText: {
+    color: '#FF4C4C',
+    fontSize: 10,
+    fontWeight: 'bold',
+    letterSpacing: 0.5
+  },
+  emptyAlertsContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 40
+  },
+  emptyAlertsTitle: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 12
+  },
+  emptyAlertsText: {
+    color: '#888',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 6
+  }
 });
