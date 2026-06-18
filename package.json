@@ -10,6 +10,7 @@
     "expo": "~56.0.12",
     "expo-av": "^16.0.8",
     "expo-constants": "~56.0.16",
+    "expo-dev-client": "~56.0.20",
     "expo-device": "~56.0.4",
     "expo-document-picker": "~56.0.4",
     "expo-file-system": "~56.0.7",
@@ -51,7 +52,10 @@
   "expo": {
     "doctor": {
       "reactNativeDirectoryCheck": {
-        "exclude": ["expo-av", "expo-modules-jsi"]
+        "exclude": [
+          "expo-av",
+          "expo-modules-jsi"
+        ]
       }
     }
   }
