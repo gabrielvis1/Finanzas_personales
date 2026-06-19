@@ -5,7 +5,7 @@ import { useAuth } from '@/providers/AuthProvider';
 import { FontAwesome } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { analyzeReceipt, processVoiceAssistant } from '@/lib/gemini';
-import { Audio } from 'expo-av';
+import { useAudioRecorder, RecordingPresets, requestRecordingPermissionsAsync } from 'expo-audio';
 import * as FileSystem from 'expo-file-system';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { formatCurrency } from '@/lib/utils';
@@ -101,7 +101,7 @@ export default function CashFlowScreen() {
   };
 
   // Voice State
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const [isRecording, setIsRecording] = useState(false);
   const [aiMessage, setAiMessage] = useState('');
   const [chatHistory, setChatHistory] = useState('');
@@ -177,10 +177,13 @@ export default function CashFlowScreen() {
 
   const startRecording = async () => {
     try {
-      await Audio.requestPermissionsAsync();
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-      const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-      setRecording(recording);
+      const { status } = await requestRecordingPermissionsAsync();
+      if (status !== 'granted') {
+        setErrorMsg('Permiso de micrófono no otorgado');
+        return;
+      }
+      await recorder.prepareToRecordAsync();
+      recorder.record();
       setIsRecording(true);
       setErrorMsg('');
     } catch (err) {
@@ -192,10 +195,8 @@ export default function CashFlowScreen() {
     setIsRecording(false);
     setAiLoading(true);
     try {
-      if (!recording) return;
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
+      await recorder.stop();
+      const uri = recorder.uri;
 
       if (uri) {
         let base64data = '';
