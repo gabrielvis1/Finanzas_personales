@@ -1,5 +1,5 @@
 {
-  "name": "app-finiax",
+  "name": "Finiax",
   "main": "expo-router/entry",
   "version": "1.0.0",
   "dependencies": {
@@ -8,6 +8,7 @@
     "@react-native-community/datetimepicker": "9.1.0",
     "@supabase/supabase-js": "^2.107.0",
     "expo": "~56.0.12",
+    "expo-asset": "~56.0.17",
     "expo-audio": "~56.0.12",
     "expo-constants": "~56.0.16",
     "expo-dev-client": "~56.0.20",
